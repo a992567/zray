@@ -21,6 +21,7 @@ const vision = @import("../proxy/vision.zig");
 const socks5 = @import("../proxy/socks5.zig");
 const fingerprint = @import("../tls/fingerprint.zig");
 const sniff = @import("../proxy/sniff.zig");
+const mux = @import("../proxy/mux.zig");
 
 const max_rec = tls.max_ciphertext_record_len;
 /// Largest chunk read from the SOCKS client per event (xray uses 8 KiB).
@@ -41,7 +42,7 @@ pub const Config = struct {
 
 pub const Inbound = enum { socks5, redirect };
 
-pub const Side = enum(u1) { client = 0, upstream = 1 };
+pub const Side = enum(u2) { client = 0, upstream = 1, udp = 2 };
 
 pub const State = enum {
     free,
@@ -56,11 +57,22 @@ pub const Conn = struct {
     state: State = .free,
     slot: u32,
     /// Incremented on every reuse so stale epoll events can be ignored.
-    gen: u32 = 0,
+    gen: u30 = 0,
     client_fd: sys.fd_t = -1,
     up_fd: sys.fd_t = -1,
     client_ev: u32 = 0,
     up_ev: u32 = 0,
+    udp_ev: u32 = 0,
+
+    // SOCKS5 UDP ASSOCIATE: `client_fd` is only the control connection, packets
+    // flow on `udp_fd` and are carried upstream as XUDP mux frames.
+    is_udp: bool = false,
+    udp_fd: sys.fd_t = -1,
+    udp_peer: ?sys.SockAddr = null,
+    udp_started: bool = false,
+    global_id: [8]u8 = undefined,
+    mux_in: [mux.max_frame_len]u8 = undefined,
+    mux_in_len: usize = 0,
     last_active: u64 = 0,
     client_eof: bool = false,
     /// Upstream finished sending; close once `c_out` is drained.
@@ -95,7 +107,7 @@ pub const Conn = struct {
     target_port: u16 = 0,
 
     pub fn token(c: *const Conn, side: Side) u64 {
-        return (@as(u64, c.gen) << 33) | (@as(u64, c.slot) << 1) | @backingInt(side);
+        return (@as(u64, c.gen) << 34) | (@as(u64, c.slot) << 2) | @backingInt(side);
     }
 
     /// Both directions switched to Vision direct copy: outer TLS is gone.
@@ -137,6 +149,12 @@ pub const Loop = struct {
         c.up_fd = -1;
         c.client_ev = 0;
         c.up_ev = 0;
+        c.udp_ev = 0;
+        c.is_udp = false;
+        c.udp_fd = -1;
+        c.udp_peer = null;
+        c.udp_started = false;
+        c.mux_in_len = 0;
         c.cin_len = 0;
         c.up_out_off = 0;
         c.up_out_len = 0;
@@ -198,6 +216,11 @@ pub const Loop = struct {
             sys.close(c.up_fd);
             c.up_fd = -1;
         }
+        if (c.udp_fd >= 0) {
+            sys.epollDel(l.ep, c.udp_fd);
+            sys.close(c.udp_fd);
+            c.udp_fd = -1;
+        }
         c.state = .free;
         l.active -= 1;
     }
@@ -214,9 +237,11 @@ pub const Loop = struct {
 
     /// Dispatch one epoll event.
     pub fn handle(l: *Loop, tok: u64, events: u32) void {
-        const slot: usize = @intCast((tok >> 1) & 0xffff_ffff);
-        const gen: u32 = @intCast(tok >> 33);
-        const side: Side = @fromBackingInt(@as(u1, @intCast(tok & 1)));
+        const slot: usize = @intCast((tok >> 2) & 0xffff_ffff);
+        const gen: u30 = @intCast(tok >> 34);
+        const side_bits: u2 = @intCast(tok & 3);
+        if (side_bits == 3) return;
+        const side: Side = @fromBackingInt(side_bits);
         if (slot >= l.conns.len) return;
         const c = &l.conns[slot];
         if (c.state == .free or c.gen != gen) return; // stale
@@ -236,6 +261,10 @@ pub const Loop = struct {
                     else => return l.close(c, @errorName(e)),
                 };
                 if (fail and c.state != .free) return l.upstreamDone(c);
+            },
+            .udp => {
+                // Unconnected UDP socket: no ERR/HUP semantics worth acting on.
+                if (events & sys.EPOLL.IN != 0) l.readUdp(c) catch |e| return l.close(c, @errorName(e));
             },
         }
         if (c.state != .free) l.updateInterest(c);
@@ -258,10 +287,19 @@ pub const Loop = struct {
     fn updateInterest(l: *Loop, c: *Conn) void {
         var cev: u32 = sys.EPOLL.RDHUP;
         if (c.c_out_len > 0) cev |= sys.EPOLL.OUT;
-        if (!c.client_eof and c.up_out_len == 0 and c.cin_len < c.cin.len) cev |= sys.EPOLL.IN;
+        if (c.is_udp or (!c.client_eof and c.up_out_len == 0 and c.cin_len < c.cin.len)) cev |= sys.EPOLL.IN;
         if (cev != c.client_ev) {
             sys.epollMod(l.ep, c.client_fd, cev, c.token(.client)) catch {};
             c.client_ev = cev;
+        }
+        if (c.udp_fd >= 0) {
+            // Datagrams wait in the kernel until the tunnel is up and the
+            // upstream queue is empty.
+            const dev: u32 = if (c.state == .relay and c.up_out_len == 0) sys.EPOLL.IN else 0;
+            if (dev != c.udp_ev) {
+                sys.epollMod(l.ep, c.udp_fd, dev, c.token(.udp)) catch {};
+                c.udp_ev = dev;
+            }
         }
         if (c.up_fd < 0) return;
         var uev: u32 = sys.EPOLL.RDHUP;
@@ -277,6 +315,17 @@ pub const Loop = struct {
 
     fn readClient(l: *Loop, c: *Conn) !void {
         if (c.client_eof) return; // RDHUP can be reported more than once
+        if (c.is_udp) {
+            // Control connection: nothing meaningful arrives, but its EOF ends
+            // the association.
+            var junk: [256]u8 = undefined;
+            const n = sys.read(c.client_fd, &junk) catch |e| switch (e) {
+                error.WouldBlock => return,
+                else => return e,
+            };
+            if (n == 0) return error.UdpControlClosed;
+            return;
+        }
         if (c.up_out_len > 0 or c.cin_len == c.cin.len) return; // back-pressure
         const n = sys.read(c.client_fd, c.cin[c.cin_len..]) catch |e| switch (e) {
             error.WouldBlock => return,
@@ -340,6 +389,11 @@ pub const Loop = struct {
                 }
                 c.target_port = req.port;
                 c.consumeClient(req.len);
+                if (req.command == .udp_associate) {
+                    try l.openUdpRelay(c);
+                    try l.connectUpstream(c);
+                    return;
+                }
                 // Reply right away (like xray) so the client starts its own TLS
                 // handshake while we connect upstream; its bytes queue in `cin`.
                 l.queueClient(c, &socks5.reply(.succeeded));
@@ -369,6 +423,109 @@ pub const Loop = struct {
         c.up_out_off = 0;
         c.cin_len = 0;
         try l.flushUpstream(c);
+    }
+
+    // ---- UDP ASSOCIATE -------------------------------------------------------
+
+    /// Bind a relay socket on the same local IP as the control connection and
+    /// tell the client where to send datagrams.
+    fn openUdpRelay(l: *Loop, c: *Conn) !void {
+        var local = try sys.localAddr(c.client_fd);
+        switch (local) {
+            .v4 => |*a| a.port = 0,
+            .v6 => |*a| a.port = 0,
+        }
+        const fd = try sys.udpSocket(local.family());
+        errdefer sys.close(fd);
+        if (l.cfg.sock_buf > 0) sys.setBufferSizes(fd, l.cfg.sock_buf, l.cfg.sock_buf);
+        try sys.bind(fd, &local);
+        const bound = try sys.localAddr(fd);
+        try sys.epollAdd(l.ep, fd, 0, c.token(.udp));
+        c.udp_fd = fd;
+        c.udp_ev = 0;
+        c.is_udp = true;
+        c.sniff_enabled = false;
+        sys.randomBytes(&c.global_id);
+
+        var rb: [22]u8 = undefined;
+        const addr: socks5.Address = switch (bound) {
+            .v4 => |a| .{ .ipv4 = @bitCast(a.addr) },
+            .v6 => |a| .{ .ipv6 = a.addr },
+        };
+        l.queueClient(c, socks5.replyBound(&rb, addr, bound.getPort()));
+        try l.flushClient(c);
+    }
+
+    /// One datagram from the client -> one XUDP frame in one TLS record.
+    fn readUdp(l: *Loop, c: *Conn) !void {
+        if (c.state != .relay or c.up_out_len > 0) return;
+        const dg = sys.recvFrom(c.udp_fd, &c.cin) catch |e| switch (e) {
+            error.WouldBlock => return,
+            else => return e,
+        };
+        if (c.udp_peer) |p| {
+            if (!p.eql(dg.from)) return; // not our client
+        } else c.udp_peer = dg.from;
+        const dgram = c.cin[0..dg.len];
+        const hdr = (socks5.parseUdpHeader(dgram) catch return) orelse return;
+        const payload = dgram[hdr.len..];
+        if (payload.len == 0 or payload.len > mux.max_packet_len) return;
+        const addr: mux.Address = switch (hdr.address) {
+            .ipv4 => |a| .{ .ipv4 = a },
+            .ipv6 => |a| .{ .ipv6 = a },
+            .domain => |d| .{ .domain = d },
+        };
+
+        var frame_buf: [client_chunk + 300]u8 = undefined;
+        const frame = if (!c.udp_started)
+            mux.encodeNew(&frame_buf, addr, hdr.port, c.global_id, payload) catch return
+        else
+            mux.encodeKeep(&frame_buf, addr, hdr.port, payload) catch return;
+        c.udp_started = true;
+
+        var padded_buf: [client_chunk + 300 + 2 * vision.max_overhead]u8 = undefined;
+        const padded = c.padder.pad(frame, &padded_buf) catch return error.VisionPad;
+        const rec = c.tls.encrypt(padded, &c.up_out) catch return error.TlsEncrypt;
+        c.up_out_off = 0;
+        c.up_out_len = rec.len;
+        try l.flushUpstream(c);
+    }
+
+    /// Parse complete mux frames out of `mux_in` and hand packets to the client.
+    fn drainMux(c: *Conn) !void {
+        var off: usize = 0;
+        while (off < c.mux_in_len) {
+            const f = (mux.parse(c.mux_in[off..c.mux_in_len]) catch return error.MuxFrame) orelse break;
+            off += f.len;
+            switch (f.status) {
+                .end => return error.UpstreamEof,
+                .keep_alive, .new => continue,
+                .keep => {},
+            }
+            if (f.data.len == 0) continue;
+            const peer = c.udp_peer orelse continue;
+            // Source address: what the frame says, else the association target.
+            const src: socks5.Address = if (f.addr) |a| switch (a) {
+                .ipv4 => |x| .{ .ipv4 = x },
+                .ipv6 => |x| .{ .ipv6 = x },
+                .domain => |d| .{ .domain = d },
+            } else switch (c.target_kind) {
+                .ipv4 => .{ .ipv4 = c.target_buf[0..4].* },
+                .ipv6 => .{ .ipv6 = c.target_buf[0..16].* },
+                .domain => .{ .domain = c.target_buf[0..c.target_len] },
+            };
+            const port = if (f.addr != null) f.port else c.target_port;
+            var out: [socks5.max_udp_header_len + mux.max_packet_len]u8 = undefined;
+            const h = socks5.encodeUdpHeader(&out, src, port) catch continue;
+            if (h.len + f.data.len > out.len) continue;
+            @memcpy(out[h.len..][0..f.data.len], f.data);
+            // Best effort: a full socket buffer just drops the packet, like UDP.
+            _ = sys.sendTo(c.udp_fd, out[0 .. h.len + f.data.len], &peer) catch {};
+        }
+        if (off > 0) {
+            mem.copyForwards(u8, c.mux_in[0 .. c.mux_in_len - off], c.mux_in[off..c.mux_in_len]);
+            c.mux_in_len -= off;
+        }
     }
 
     fn queueClient(_: *Loop, c: *Conn, bytes: []const u8) void {
@@ -524,9 +681,16 @@ pub const Loop = struct {
                     data = data[resp.len..];
                 }
                 const content = c.unpadder.feed(data);
-                @memcpy(c.c_out[0..content.len], content);
-                c.c_out_off = 0;
-                c.c_out_len = content.len;
+                if (c.is_udp) {
+                    if (c.mux_in_len + content.len > c.mux_in.len) return error.MuxFrameTooLarge;
+                    @memcpy(c.mux_in[c.mux_in_len..][0..content.len], content);
+                    c.mux_in_len += content.len;
+                    try drainMux(c);
+                } else {
+                    @memcpy(c.c_out[0..content.len], content);
+                    c.c_out_off = 0;
+                    c.c_out_len = content.len;
+                }
             }
 
             // Drop the consumed record.
@@ -535,6 +699,7 @@ pub const Loop = struct {
             c.uin_len = rest;
 
             if (c.state == .relay and c.unpadder.direct) {
+                if (c.is_udp) return error.UnexpectedDirect; // mux is never TLS-in-TLS
                 sys.log("[{d}] vision downlink -> direct", .{c.slot});
                 // Whatever is left in uin is already the raw inner stream.
                 @memcpy(c.c_out[c.c_out_len..][0..c.uin_len], c.uin[0..c.uin_len]);
@@ -555,6 +720,19 @@ pub const Loop = struct {
             .ipv6 => .{ .ipv6 = c.target_buf[0..16].* },
             .domain => .{ .domain = c.target_buf[0..c.target_len] },
         };
+        if (c.is_udp) {
+            // XUDP: everything rides one Mux stream; targets live in the frames.
+            const hdr = vless.encodeRequest(&buf, .{
+                .uuid = c.vstate.uuid,
+                .flow = .vision,
+                .command = .mux,
+                .address = .{ .domain = "v1.mux.cool" },
+                .port = 666,
+            }) catch return error.VlessRequest;
+            const padded = c.padder.padEmpty(buf[hdr.len..]) catch return error.VisionPad;
+            try queueUpstreamRecord(c, buf[0 .. hdr.len + padded.len]);
+            return;
+        }
         if (c.sniff_enabled and c.target_kind != .domain and c.cin_len > 0) {
             switch (sniff.sniff(c.cin[0..c.cin_len])) {
                 .host => |h| {
@@ -577,9 +755,14 @@ pub const Loop = struct {
             c.padder.padEmpty(buf[n..]) catch return error.VisionPad;
         n += padded.len;
         c.cin_len = 0;
-        // Goes right behind the client Finished that is still queued in up_out.
+        try queueUpstreamRecord(c, buf[0..n]);
+    }
+
+    /// Encrypt and append behind whatever is already queued in `up_out`
+    /// (the client Finished, typically).
+    fn queueUpstreamRecord(c: *Conn, plaintext: []const u8) !void {
         var rec_buf: [max_rec]u8 = undefined;
-        const rec = c.tls.encrypt(buf[0..n], &rec_buf) catch return error.TlsEncrypt;
+        const rec = c.tls.encrypt(plaintext, &rec_buf) catch return error.TlsEncrypt;
         if (c.up_out_off + c.up_out_len + rec.len > c.up_out.len) return error.UpstreamQueueFull;
         @memcpy(c.up_out[c.up_out_off + c.up_out_len ..][0..rec.len], rec);
         c.up_out_len += rec.len;

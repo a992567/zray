@@ -54,6 +54,21 @@ pub const SockAddr = union(enum) {
             .v6 => |*p| @ptrCast(p),
         };
     }
+    /// Decode the kernel's sockaddr output (sockaddr_in6 is large enough for both).
+    fn fromRaw(raw: *const linux.sockaddr.in6) Error!SockAddr {
+        const fam = @as(*const linux.sockaddr, @ptrCast(raw)).family;
+        if (fam == linux.AF.INET) return .{ .v4 = @as(*const linux.sockaddr.in, @ptrCast(raw)).* };
+        if (fam == linux.AF.INET6) return .{ .v6 = raw.* };
+        return error.Unexpected;
+    }
+
+    pub fn eql(a: SockAddr, b: SockAddr) bool {
+        return switch (a) {
+            .v4 => |x| b == .v4 and x.port == b.v4.port and x.addr == b.v4.addr,
+            .v6 => |x| b == .v6 and x.port == b.v6.port and std.mem.eql(u8, &x.addr, &b.v6.addr),
+        };
+    }
+
     fn len(a: SockAddr) linux.socklen_t {
         return switch (a) {
             .v4 => @sizeOf(linux.sockaddr.in),
@@ -77,6 +92,31 @@ pub const SockAddr = union(enum) {
 pub fn tcpSocket(fam: u32) Error!fd_t {
     const rc = try check(linux.socket(fam, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0));
     return @intCast(rc);
+}
+
+pub fn udpSocket(fam: u32) Error!fd_t {
+    const rc = try check(linux.socket(fam, linux.SOCK.DGRAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0));
+    return @intCast(rc);
+}
+
+pub fn localAddr(fd: fd_t) Error!SockAddr {
+    var raw: linux.sockaddr.in6 = undefined;
+    var alen: linux.socklen_t = @sizeOf(linux.sockaddr.in6);
+    _ = try check(linux.getsockname(fd, @ptrCast(&raw), &alen));
+    return SockAddr.fromRaw(&raw);
+}
+
+pub const Datagram = struct { len: usize, from: SockAddr };
+
+pub fn recvFrom(fd: fd_t, buf: []u8) Error!Datagram {
+    var raw: linux.sockaddr.in6 = undefined;
+    var alen: linux.socklen_t = @sizeOf(linux.sockaddr.in6);
+    const n = try check(linux.recvfrom(fd, buf.ptr, buf.len, 0, @ptrCast(&raw), &alen));
+    return .{ .len = n, .from = try SockAddr.fromRaw(&raw) };
+}
+
+pub fn sendTo(fd: fd_t, buf: []const u8, to: *const SockAddr) Error!usize {
+    return check(linux.sendto(fd, buf.ptr, buf.len, 0, to.ptr(), to.len()));
 }
 
 pub fn setsockoptInt(fd: fd_t, level: i32, opt: u32, value: i32) Error!void {
