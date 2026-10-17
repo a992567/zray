@@ -1,5 +1,7 @@
 {
-  "listen": "127.0.0.1:1080",
+  "listen": "127.0.0.1:10800",
+  "redirect": "127.0.0.1:10801",
+  "sniff": true,
   "server": "example.com",
   "port": 2443,
   "sni": "example.com",

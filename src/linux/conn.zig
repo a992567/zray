@@ -20,6 +20,7 @@ const vless = @import("../proxy/vless.zig");
 const vision = @import("../proxy/vision.zig");
 const socks5 = @import("../proxy/socks5.zig");
 const fingerprint = @import("../tls/fingerprint.zig");
+const sniff = @import("../proxy/sniff.zig");
 
 const max_rec = tls.max_ciphertext_record_len;
 /// Largest chunk read from the SOCKS client per event (xray uses 8 KiB).
@@ -34,7 +35,11 @@ pub const Config = struct {
     idle_timeout_s: u64 = 600,
     /// Per-socket SO_RCVBUF / SO_SNDBUF; 0 = kernel default.
     sock_buf: i32 = 0,
+    /// Replace redirected IP targets with the sniffed TLS SNI / HTTP Host.
+    sniff: bool = true,
 };
+
+pub const Inbound = enum { socks5, redirect };
 
 pub const Side = enum(u1) { client = 0, upstream = 1 };
 
@@ -83,6 +88,7 @@ pub const Conn = struct {
     padder: vision.Padder = undefined,
     unpadder: vision.Unpadder = undefined,
     got_resp_hdr: bool = false,
+    sniff_enabled: bool = false,
     target_kind: enum { ipv4, ipv6, domain } = .domain,
     target_buf: [255]u8 = undefined,
     target_len: u8 = 0,
@@ -119,7 +125,7 @@ pub const Loop = struct {
 
     // ---- lifecycle -----------------------------------------------------------
 
-    pub fn accept(l: *Loop, fd: sys.fd_t) void {
+    pub fn accept(l: *Loop, fd: sys.fd_t, kind: Inbound) void {
         const c = l.findFree() orelse {
             sys.log("conn table full, dropping client", .{});
             sys.close(fd);
@@ -140,6 +146,7 @@ pub const Loop = struct {
         c.client_eof = false;
         c.up_eof = false;
         c.got_resp_hdr = false;
+        c.sniff_enabled = l.cfg.sniff;
         c.last_active = sys.monotonicSeconds();
         sys.setNoDelay(fd);
         if (l.cfg.sock_buf > 0) sys.setBufferSizes(fd, l.cfg.sock_buf, l.cfg.sock_buf);
@@ -150,6 +157,27 @@ pub const Loop = struct {
         };
         c.client_ev = sys.EPOLL.IN | sys.EPOLL.RDHUP;
         l.active += 1;
+
+        if (kind == .redirect) {
+            // Transparent (REDIRECT) inbound: the target is the original
+            // destination; there is no SOCKS exchange.
+            const dst = sys.originalDst(fd) catch return l.close(c, "no SO_ORIGINAL_DST");
+            switch (dst) {
+                .v4 => |a| {
+                    c.target_kind = .ipv4;
+                    c.target_buf[0..4].* = @bitCast(a.addr);
+                    c.target_len = 4;
+                },
+                .v6 => |a| {
+                    c.target_kind = .ipv6;
+                    c.target_buf[0..16].* = a.addr;
+                    c.target_len = 16;
+                },
+            }
+            c.target_port = dst.getPort();
+            l.connectUpstream(c) catch |e| return l.close(c, @errorName(e));
+            l.updateInterest(c);
+        }
     }
 
     fn findFree(l: *Loop) ?*Conn {
@@ -522,11 +550,20 @@ pub const Loop = struct {
     fn sendVlessRequest(c: *Conn) !void {
         c.state = .relay;
         var buf: [vless.max_request_len + client_chunk + 2 * vision.max_overhead]u8 = undefined;
-        const addr: vless.Address = switch (c.target_kind) {
+        var addr: vless.Address = switch (c.target_kind) {
             .ipv4 => .{ .ipv4 = c.target_buf[0..4].* },
             .ipv6 => .{ .ipv6 = c.target_buf[0..16].* },
             .domain => .{ .domain = c.target_buf[0..c.target_len] },
         };
+        if (c.sniff_enabled and c.target_kind != .domain and c.cin_len > 0) {
+            switch (sniff.sniff(c.cin[0..c.cin_len])) {
+                .host => |h| {
+                    sys.log("[{d}] sniffed {s}:{d}", .{ c.slot, h, c.target_port });
+                    addr = .{ .domain = h };
+                },
+                else => {},
+            }
+        }
         const hdr = vless.encodeRequest(&buf, .{
             .uuid = c.vstate.uuid,
             .flow = .vision,

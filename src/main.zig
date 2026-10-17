@@ -12,7 +12,12 @@ const Io = std.Io;
 pub const version = "0.1.0";
 
 const FileConfig = struct {
+    /// SOCKS5 inbound; empty string disables it.
     listen: []const u8 = "127.0.0.1:1080",
+    /// Transparent inbound for netfilter REDIRECT (iptables -j REDIRECT /
+    /// nft redirect to); empty string disables it.
+    redirect: []const u8 = "",
+    sniff: bool = true,
     server: []const u8,
     port: u16 = 443,
     sni: []const u8 = "",
@@ -82,26 +87,27 @@ fn linuxMain(init: std.process.Init) !void {
         .handshake_timeout_s = parsed.handshake_timeout_s,
         .idle_timeout_s = parsed.idle_timeout_s,
         .sock_buf = parsed.sock_buf,
+        .sniff = parsed.sniff,
     };
 
-    // Listener.
-    const colon = std.mem.lastIndexOfScalar(u8, parsed.listen, ':') orelse return error.BadListen;
-    const listen_addr = try sys.SockAddr.parseIp(parsed.listen[0..colon], try std.fmt.parseInt(u16, parsed.listen[colon + 1 ..], 10));
-    const lfd = try sys.tcpSocket(listen_addr.family());
-    sys.setReuseAddr(lfd);
-    try sys.bind(lfd, &listen_addr);
-    try sys.listen(lfd, 128);
-
+    if (parsed.listen.len == 0 and parsed.redirect.len == 0) {
+        sys.log("nothing to listen on: set listen and/or redirect", .{});
+        return error.BadListen;
+    }
     sys.ignoreSigpipe();
     const ep = try sys.epollCreate();
-    const listener_token: u64 = std.math.maxInt(u64);
-    try sys.epollAdd(ep, lfd, sys.EPOLL.IN, listener_token);
+    const socks_token: u64 = std.math.maxInt(u64);
+    const redirect_token: u64 = std.math.maxInt(u64) - 1;
+    const socks_fd: ?sys.fd_t = if (parsed.listen.len > 0) try listenOn(parsed.listen) else null;
+    const redirect_fd: ?sys.fd_t = if (parsed.redirect.len > 0) try listenOn(parsed.redirect) else null;
+    if (socks_fd) |fd| try sys.epollAdd(ep, fd, sys.EPOLL.IN, socks_token);
+    if (redirect_fd) |fd| try sys.epollAdd(ep, fd, sys.EPOLL.IN, redirect_token);
 
     const conns = try std.heap.page_allocator.alloc(conn.Conn, parsed.max_connections);
     var loop = conn.Loop.init(ep, &cfg, conns);
-    sys.log("zray {s} listening on {s}, upstream {s}:{d} (sni {s}), {d} slots x {d} KiB = {d} KiB", .{
-        version,                parsed.listen,             parsed.server,                                        parsed.port, cfg.sni,
-        parsed.max_connections, @sizeOf(conn.Conn) / 1024, (@sizeOf(conn.Conn) * parsed.max_connections) / 1024,
+    sys.log("zray {s} socks5 [{s}] redirect [{s}] sniff {}, upstream {s}:{d} (sni {s}), {d} slots x {d} KiB = {d} KiB", .{
+        version,     parsed.listen, parsed.redirect,        parsed.sniff,              parsed.server,
+        parsed.port, cfg.sni,       parsed.max_connections, @sizeOf(conn.Conn) / 1024, (@sizeOf(conn.Conn) * parsed.max_connections) / 1024,
     });
 
     var events: [64]sys.Event = undefined;
@@ -112,10 +118,12 @@ fn linuxMain(init: std.process.Init) !void {
             continue;
         };
         for (events[0..n]) |ev| {
-            if (ev.data.u64 == listener_token) {
+            if (ev.data.u64 == socks_token or ev.data.u64 == redirect_token) {
+                const is_socks = ev.data.u64 == socks_token;
+                const lfd = if (is_socks) socks_fd.? else redirect_fd.?;
                 while (true) {
                     const fd = sys.accept(lfd) catch break;
-                    loop.accept(fd);
+                    loop.accept(fd, if (is_socks) .socks5 else .redirect);
                 }
             } else {
                 loop.handle(ev.data.u64, ev.events);
@@ -127,6 +135,20 @@ fn linuxMain(init: std.process.Init) !void {
             loop.sweep();
         }
     }
+}
+
+fn listenOn(spec: []const u8) !@import("linux/sys.zig").fd_t {
+    const sys = @import("linux/sys.zig");
+    const colon = std.mem.lastIndexOfScalar(u8, spec, ':') orelse return error.BadListen;
+    const addr = try sys.SockAddr.parseIp(spec[0..colon], try std.fmt.parseInt(u16, spec[colon + 1 ..], 10));
+    const fd = try sys.tcpSocket(addr.family());
+    sys.setReuseAddr(fd);
+    sys.bind(fd, &addr) catch |e| {
+        sys.log("cannot bind {s}: {s}", .{ spec, @errorName(e) });
+        return e;
+    };
+    try sys.listen(fd, 128);
+    return fd;
 }
 
 /// IP literal or DNS name -> socket address (blocking, startup only).

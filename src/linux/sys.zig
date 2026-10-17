@@ -36,6 +36,12 @@ pub const SockAddr = union(enum) {
     pub fn fromIpv6(ip: [16]u8, port: u16) SockAddr {
         return .{ .v6 = .{ .port = std.mem.nativeToBig(u16, port), .flowinfo = 0, .addr = ip, .scope_id = 0 } };
     }
+    pub fn getPort(a: SockAddr) u16 {
+        return std.mem.bigToNative(u16, switch (a) {
+            .v4 => |p| p.port,
+            .v6 => |p| p.port,
+        });
+    }
     pub fn family(a: SockAddr) u32 {
         return switch (a) {
             .v4 => linux.AF.INET,
@@ -124,6 +130,22 @@ pub fn connectResult(fd: fd_t) Error!void {
     var len: linux.socklen_t = @sizeOf(i32);
     _ = try check(linux.getsockopt(fd, linux.SOL.SOCKET, linux.SO.ERROR, @ptrCast(&err), &len));
     if (err != 0) _ = try check(@as(usize, @bitCast(@as(isize, -err))));
+}
+
+/// Original destination of a connection redirected by netfilter REDIRECT
+/// (iptables -j REDIRECT / nft redirect). Linux reports it via
+/// SO_ORIGINAL_DST (80) on SOL_IP, or IP6T_SO_ORIGINAL_DST (80) on SOL_IPV6.
+pub fn originalDst(fd: fd_t) Error!SockAddr {
+    const SO_ORIGINAL_DST: u32 = 80;
+    var v4: linux.sockaddr.in = undefined;
+    var len4: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+    if (linux.errno(linux.getsockopt(fd, linux.SOL.IP, SO_ORIGINAL_DST, @ptrCast(&v4), &len4)) == .SUCCESS) {
+        return .{ .v4 = v4 };
+    }
+    var v6: linux.sockaddr.in6 = undefined;
+    var len6: linux.socklen_t = @sizeOf(linux.sockaddr.in6);
+    _ = try check(linux.getsockopt(fd, linux.SOL.IPV6, SO_ORIGINAL_DST, @ptrCast(&v6), &len6));
+    return .{ .v6 = v6 };
 }
 
 pub fn read(fd: fd_t, buf: []u8) Error!usize {
