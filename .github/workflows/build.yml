@@ -1,0 +1,69 @@
+name: build
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: mipsel-softfloat
+            target: mipsel-linux-musl
+            cpu: mips32r2+soft_float
+          - name: mips-softfloat
+            target: mips-linux-musl
+            cpu: mips32r2+soft_float
+          - name: aarch64
+            target: aarch64-linux-musl
+            cpu: baseline
+          - name: arm-v7
+            target: arm-linux-musleabihf
+            cpu: generic+v7a
+          - name: x86_64
+            target: x86_64-linux-musl
+            cpu: baseline
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: build (ReleaseSmall)
+        run: |
+          zig build --release -Dtarget=${{ matrix.target }} -Dcpu=${{ matrix.cpu }} -p out
+          ls -l out/bin/zray
+          mv out/bin/zray zray-${{ matrix.name }}
+          sha256sum zray-${{ matrix.name }} > zray-${{ matrix.name }}.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zray-${{ matrix.name }}
+          path: |
+            zray-${{ matrix.name }}
+            zray-${{ matrix.name }}.sha256
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

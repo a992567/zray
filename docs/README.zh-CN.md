@@ -36,7 +36,9 @@
 
 ## 构建
 
-需要 Zig 0.17.0。
+需要 Zig 0.17.0。每个 tag 发布都附带 mipsel / mips / aarch64 / armv7 / x86_64
+的预编译二进制（全部静态 musl）；CI 对每次 push 都会构建（见
+.github/workflows/）。
 
 ```sh
 zig build test                                   # 单元测试（本机）

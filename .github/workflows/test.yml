@@ -1,0 +1,25 @@
+name: test
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: zig fmt --check
+        run: zig fmt --check src build.zig
+
+      - name: unit tests
+        run: zig build test --summary all
+
+      - name: host build (debug, catches Linux-only code paths)
+        run: zig build

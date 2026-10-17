@@ -41,7 +41,9 @@ it), TPROXY, SOCKS5 UDP fragmentation.
 
 ## Building
 
-Requires Zig 0.17.0.
+Requires Zig 0.17.0. Prebuilt binaries for mipsel / mips / aarch64 / armv7 /
+x86_64 (all static musl) are attached to each tagged release; CI builds every
+push (see .github/workflows/).
 
 ```sh
 zig build test                                   # unit tests (host)
