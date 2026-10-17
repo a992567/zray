@@ -1,5 +1,7 @@
 # zray
 
+English | [简体中文](docs/README.zh-CN.md)
+
 A minimal [REALITY](https://github.com/XTLS/REALITY) client (VLESS +
 `xtls-rprx-vision`) for home routers, written in Zig with no dependencies
 beyond the Zig standard library.
