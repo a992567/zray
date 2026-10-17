@@ -65,6 +65,10 @@ pub fn main(init: std.process.Init) !void {
     const now_s: i64 = @intCast(@divFloor(now_ns, std.time.ns_per_s));
     var rl = reality.Reality.init(cfg, now_s);
 
+    var seed: [32]u8 = undefined;
+    try io.randomSecure(&seed);
+    var csprng = std.Random.DefaultCsprng.init(seed);
+
     var entropy: [64]u8 = undefined;
     try io.randomSecure(&entropy);
     var hs_buf: [8 * 1024]u8 = undefined;
@@ -75,13 +79,14 @@ pub fn main(init: std.process.Init) !void {
     });
 
     const zero_sid: [32]u8 = @splat(0);
-    var hello_buf: [2048]u8 = undefined;
-    const key_shares = [_]hello.KeyShareEntry{.{ .group = .x25519, .public_key = c.publicKey() }};
+    var hello_buf: [4096]u8 = undefined;
+    var fp: fingerprint.Chrome = undefined;
+    fp.build(csprng.random(), .{ .sni = sni, .x25519_public = c.publicKey() });
     const first = try c.clientHello(&hello_buf, .{
         .random = undefined,
         .session_id = &zero_sid,
-        .cipher_suites = &chrome_suites,
-        .extensions = &chromeExtensions(sni, &key_shares),
+        .cipher_suites = fp.cipherSuites(),
+        .extensions = fp.extensions(),
     }, rl.helloHook());
     if (rl.err) |e| {
         try out.print("REALITY hook failed: {s}\n", .{@errorName(e)});
@@ -128,9 +133,6 @@ pub fn main(init: std.process.Init) !void {
     const url = try parseUrl(url_text.?);
     try out.print("tunnel: {s}://{s}:{d}{s}\n", .{ if (url.https) "https" else "http", url.host, url.port, url.path });
 
-    var seed: [32]u8 = undefined;
-    try io.randomSecure(&seed);
-    var csprng = std.Random.DefaultCsprng.init(seed);
     var vstate = vision.State.init(uuid);
     var padder = vision.Padder.init(&vstate, csprng.random());
     var unpadder = vision.Unpadder.init(&vstate);
@@ -165,14 +167,15 @@ pub fn main(init: std.process.Init) !void {
         .handshake_buf = &inner_hs_buf,
     });
     var first_payload: [2048]u8 = undefined;
+    var inner_fp: fingerprint.Chrome = undefined;
     const payload: []const u8 = if (url.https) blk: {
         tun.inner = &inner;
-        const ks = [_]hello.KeyShareEntry{.{ .group = .x25519, .public_key = inner.publicKey() }};
+        inner_fp.build(csprng.random(), .{ .sni = url.host, .x25519_public = inner.publicKey(), .alpn = &fingerprint.alpn_http11 });
         break :blk try inner.clientHello(&first_payload, .{
             .random = undefined,
             .session_id = &inner_sid,
-            .cipher_suites = &chrome_suites,
-            .extensions = &chromeExtensions(url.host, &ks),
+            .cipher_suites = inner_fp.cipherSuites(),
+            .extensions = inner_fp.extensions(),
         }, null);
     } else try std.fmt.bufPrint(&first_payload, "GET {s} HTTP/1.1\r\nHost: {s}\r\nUser-Agent: zray-probe/0.1\r\nAccept: */*\r\nConnection: close\r\n\r\n", .{ url.path, url.host });
     const padded = try padder.pad(payload, req_buf[n..]);
@@ -373,10 +376,6 @@ const Tunnel = struct {
 };
 
 const fingerprint = @import("tls/fingerprint.zig");
-const chrome_suites = fingerprint.chrome_suites;
-fn chromeExtensions(sni: []const u8, key_shares: []const hello.KeyShareEntry) [fingerprint.chrome_ext_count]hello.Extension {
-    return fingerprint.chromeExtensionsAlpn(sni, key_shares, &fingerprint.alpn_http11);
-}
 
 const Url = struct { https: bool, host: []const u8, port: u16, path: []const u8 };
 

@@ -160,7 +160,7 @@ pub const Client = struct {
     x25519: X25519.KeyPair,
     session_id: [32]u8 = undefined,
     session_id_len: u8 = 0,
-    offered_suites: [8]tls.CipherSuite = undefined,
+    offered_suites: [16]tls.CipherSuite = undefined,
     offered_suites_len: u8 = 0,
 
     // Before ServerHello both schedules track the transcript.

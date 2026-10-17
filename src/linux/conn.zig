@@ -592,13 +592,13 @@ pub const Loop = struct {
         c.unpadder = vision.Unpadder.init(&c.vstate);
 
         const zero_sid: [32]u8 = @splat(0);
-        const ks = [_]hello.KeyShareEntry{.{ .group = .x25519, .public_key = c.tls.publicKey() }};
-        const exts = fingerprint.chromeExtensions(l.cfg.sni, &ks);
+        var fp: fingerprint.Chrome = undefined;
+        fp.build(l.csprng.random(), .{ .sni = l.cfg.sni, .x25519_public = c.tls.publicKey() });
         const first = c.tls.clientHello(&c.up_out, .{
             .random = undefined,
             .session_id = &zero_sid,
-            .cipher_suites = &fingerprint.chrome_suites,
-            .extensions = &exts,
+            .cipher_suites = fp.cipherSuites(),
+            .extensions = fp.extensions(),
         }, c.rl.helloHook()) catch return error.ClientHello;
         if (c.rl.err != null) return error.RealityHook;
         c.up_out_off = 0;
