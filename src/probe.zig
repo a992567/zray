@@ -372,44 +372,10 @@ const Tunnel = struct {
     }
 };
 
-const chrome_suites = [_]tls.CipherSuite{
-    .AES_128_GCM_SHA256,
-    .AES_256_GCM_SHA384,
-    .CHACHA20_POLY1305_SHA256,
-};
-const groups = [_]tls.NamedGroup{ .x25519, .secp256r1, .secp384r1 };
-const sig_algs = [_]tls.SignatureScheme{
-    .ecdsa_secp256r1_sha256,
-    .rsa_pss_rsae_sha256,
-    .rsa_pkcs1_sha256,
-    .ecdsa_secp384r1_sha384,
-    .rsa_pss_rsae_sha384,
-    .rsa_pkcs1_sha384,
-    .rsa_pss_rsae_sha512,
-    .rsa_pkcs1_sha512,
-};
-const versions = [_]tls.ProtocolVersion{ .tls_1_3, .tls_1_2 };
-const psk_modes = [_]tls.PskKeyExchangeMode{.psk_dhe_ke};
-const alpns = [_][]const u8{ "h2", "http/1.1" };
-const alpn_http11 = [_][]const u8{"http/1.1"};
-
-/// Chrome-ordered extension list (no GREASE/ML-KEM yet).
-fn chromeExtensions(sni: []const u8, key_shares: []const hello.KeyShareEntry) [13]hello.Extension {
-    return .{
-        .{ .server_name = sni },
-        .{ .raw = .{ .type = 0x0017 } }, // extended_master_secret
-        .{ .raw = .{ .type = 0xff01, .data = &.{0} } }, // renegotiation_info
-        .{ .supported_groups = &groups },
-        .{ .raw = .{ .type = 0x000b, .data = &.{ 1, 0 } } }, // ec_point_formats
-        .{ .raw = .{ .type = 0x0023 } }, // session_ticket
-        .{ .alpn = &alpn_http11 }, // we only speak HTTP/1.1 in this probe
-        .{ .raw = .{ .type = 0x0005, .data = &.{ 1, 0, 0, 0, 0 } } }, // status_request
-        .{ .signature_algorithms = &sig_algs },
-        .{ .raw = .{ .type = 0x0012 } }, // signed_certificate_timestamp
-        .{ .key_share = key_shares },
-        .{ .psk_key_exchange_modes = &psk_modes },
-        .{ .supported_versions = &versions },
-    };
+const fingerprint = @import("tls/fingerprint.zig");
+const chrome_suites = fingerprint.chrome_suites;
+fn chromeExtensions(sni: []const u8, key_shares: []const hello.KeyShareEntry) [fingerprint.chrome_ext_count]hello.Extension {
+    return fingerprint.chromeExtensionsAlpn(sni, key_shares, &fingerprint.alpn_http11);
 }
 
 const Url = struct { https: bool, host: []const u8, port: u16, path: []const u8 };

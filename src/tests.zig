@@ -10,6 +10,8 @@ comptime {
     _ = @import("tls/reality.zig");
     _ = @import("proxy/vless.zig");
     _ = @import("proxy/vision.zig");
+    _ = @import("proxy/socks5.zig");
+    _ = @import("tls/fingerprint.zig");
 }
 
 test {

@@ -1,0 +1,10 @@
+{
+  "listen": "127.0.0.1:1080",
+  "server": "example.com",
+  "port": 2443,
+  "sni": "example.com",
+  "public_key": "<server publicKey, base64url>",
+  "short_id": "",
+  "uuid": "123e4567-e89b-12d3-a456-426614174000",
+  "max_connections": 32
+}
