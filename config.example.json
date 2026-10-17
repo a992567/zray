@@ -1,12 +1,15 @@
 {
-  "listen": "127.0.0.1:10800",
-  "redirect": "127.0.0.1:10801",
+  "listen": "127.0.0.1:1080",
+  "redirect": "",
   "sniff": true,
   "server": "example.com",
-  "port": 2443,
+  "port": 443,
   "sni": "example.com",
   "public_key": "<server publicKey, base64url>",
   "short_id": "",
-  "uuid": "123e4567-e89b-12d3-a456-426614174000",
-  "max_connections": 32
+  "uuid": "00000000-0000-0000-0000-000000000000",
+  "max_connections": 64,
+  "handshake_timeout_s": 15,
+  "idle_timeout_s": 300,
+  "sock_buf": 0
 }
