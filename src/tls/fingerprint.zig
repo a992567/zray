@@ -85,6 +85,10 @@ pub const Chrome = struct {
         /// `ml_kem_key_share_len` bytes, or null to offer x25519 only.
         ml_kem_public: ?[]const u8 = null,
         alpn: []const []const u8 = &alpn_h2_http11,
+        /// Advertise compress_certificate (brotli). Chrome does; we cannot
+        /// decompress, so only offer it to servers known not to compress
+        /// (Go/REALITY). Off for origins such as Cloudflare.
+        compress_certificate: bool = true,
     };
 
     pub fn build(self: *Chrome, rand: std.Random, in: Input) void {
@@ -128,7 +132,9 @@ pub const Chrome = struct {
             .{ .key_share = self.key_shares[0..self.key_shares_len] },
             .{ .psk_key_exchange_modes = &psk_modes },
             .{ .supported_versions = self.versions[0..] },
-            .{ .raw = .{ .type = 0x001b, .data = &.{ 2, 0, 2 } } }, // compress_certificate: brotli
+            // compress_certificate: brotli; replaced by a harmless duplicate-free
+            // extension when disabled so the slot count stays fixed.
+            if (in.compress_certificate) .{ .raw = .{ .type = 0x001b, .data = &.{ 2, 0, 2 } } } else .{ .record_size_limit = 0x4001 },
             .{ .raw = .{ .type = 0x44cd, .data = &.{ 0, 3, 2, 'h', '2' } } }, // application_settings (ALPS)
             .{ .raw = .{ .type = 0xfe0d, .data = self.ech[0..self.ech_len] } }, // encrypted_client_hello (GREASE)
         };

@@ -69,11 +69,12 @@ pub fn main(init: std.process.Init) !void {
     try io.randomSecure(&seed);
     var csprng = std.Random.DefaultCsprng.init(seed);
 
-    var entropy: [64]u8 = undefined;
+    var entropy: [128]u8 = undefined;
     try io.randomSecure(&entropy);
     var hs_buf: [8 * 1024]u8 = undefined;
     var c = client.Client.init(.{
-        .entropy = entropy,
+        .entropy = entropy[0..64].*,
+        .ml_kem_seed = entropy[64..128].*,
         .verifier = rl.verifier(),
         .handshake_buf = &hs_buf,
     });
@@ -81,7 +82,7 @@ pub fn main(init: std.process.Init) !void {
     const zero_sid: [32]u8 = @splat(0);
     var hello_buf: [4096]u8 = undefined;
     var fp: fingerprint.Chrome = undefined;
-    fp.build(csprng.random(), .{ .sni = sni, .x25519_public = c.publicKey() });
+    fp.build(csprng.random(), .{ .sni = sni, .x25519_public = c.publicKey(), .ml_kem_public = c.mlKemPublicKey() });
     const first = try c.clientHello(&hello_buf, .{
         .random = undefined,
         .session_id = &zero_sid,
@@ -119,7 +120,7 @@ pub fn main(init: std.process.Init) !void {
             return;
         }
     }
-    try out.print("REALITY handshake OK in {d} ms ({s}, cert HMAC verified)\n", .{ msSince(io, t0), @tagName(c.suite) });
+    try out.print("REALITY handshake OK in {d} ms ({s}, group {s}, cert HMAC verified)\n", .{ msSince(io, t0), @tagName(c.suite), @tagName(c.group) });
 
     if (uuid_text == null) {
         const bye = try c.close(&out_buf);
@@ -157,12 +158,13 @@ pub fn main(init: std.process.Init) !void {
     var n: usize = hdr_bytes.len;
 
     var inner_hs_buf: [16 * 1024]u8 = undefined;
-    var inner_entropy: [64]u8 = undefined;
+    var inner_entropy: [128]u8 = undefined;
     try io.randomSecure(&inner_entropy);
     var inner_sid: [32]u8 = undefined;
     try io.randomSecure(&inner_sid);
     var inner = client.Client.init(.{
-        .entropy = inner_entropy,
+        .entropy = inner_entropy[0..64].*,
+        .ml_kem_seed = inner_entropy[64..128].*,
         .verifier = client.Verifier.insecure, // probe only; REALITY authenticates the proxy, not the origin
         .handshake_buf = &inner_hs_buf,
     });
@@ -170,7 +172,7 @@ pub fn main(init: std.process.Init) !void {
     var inner_fp: fingerprint.Chrome = undefined;
     const payload: []const u8 = if (url.https) blk: {
         tun.inner = &inner;
-        inner_fp.build(csprng.random(), .{ .sni = url.host, .x25519_public = inner.publicKey(), .alpn = &fingerprint.alpn_http11 });
+        inner_fp.build(csprng.random(), .{ .sni = url.host, .x25519_public = inner.publicKey(), .ml_kem_public = inner.mlKemPublicKey(), .alpn = &fingerprint.alpn_http11, .compress_certificate = false });
         break :blk try inner.clientHello(&first_payload, .{
             .random = undefined,
             .session_id = &inner_sid,
@@ -340,7 +342,7 @@ const Tunnel = struct {
         if (res.to_send.len > 0) try t.uplink(res.to_send, scratch);
         if (res.event == .handshake_complete and !t.inner_connected) {
             t.inner_connected = true;
-            try t.out.print("inner TLS handshake OK ({s}, alpn {s})\n", .{ @tagName(inner.suite), if (inner.alpn().len > 0) inner.alpn() else "-" });
+            try t.out.print("inner TLS handshake OK ({s}, group {s}, alpn {s})\n", .{ @tagName(inner.suite), @tagName(inner.group), if (inner.alpn().len > 0) inner.alpn() else "-" });
             var req: [1024]u8 = undefined;
             const get = try std.fmt.bufPrint(&req, "GET {s} HTTP/1.1\r\nHost: {s}\r\nUser-Agent: zray-probe/0.1\r\nAccept: */*\r\nConnection: close\r\n\r\n", .{ t.url.path, t.url.host });
             var enc: [2048]u8 = undefined;

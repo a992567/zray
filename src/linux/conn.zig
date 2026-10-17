@@ -579,11 +579,12 @@ pub const Loop = struct {
 
     fn startTls(l: *Loop, c: *Conn) !void {
         c.state = .tls_handshake;
-        var entropy: [64]u8 = undefined;
+        var entropy: [128]u8 = undefined;
         sys.randomBytes(&entropy);
         c.rl = reality.Reality.init(l.cfg.reality, sys.realtimeSeconds());
         c.tls = client.Client.init(.{
-            .entropy = entropy,
+            .entropy = entropy[0..64].*,
+            .ml_kem_seed = entropy[64..128].*,
             .verifier = c.rl.verifier(),
             .handshake_buf = &c.hs_buf,
         });
@@ -593,7 +594,7 @@ pub const Loop = struct {
 
         const zero_sid: [32]u8 = @splat(0);
         var fp: fingerprint.Chrome = undefined;
-        fp.build(l.csprng.random(), .{ .sni = l.cfg.sni, .x25519_public = c.tls.publicKey() });
+        fp.build(l.csprng.random(), .{ .sni = l.cfg.sni, .x25519_public = c.tls.publicKey(), .ml_kem_public = c.tls.mlKemPublicKey() });
         const first = c.tls.clientHello(&c.up_out, .{
             .random = undefined,
             .session_id = &zero_sid,

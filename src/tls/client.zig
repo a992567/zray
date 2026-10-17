@@ -22,6 +22,7 @@ const crypto = std.crypto;
 const tls = crypto.tls;
 const mem = std.mem;
 const X25519 = crypto.dh.X25519;
+const MLKem768 = crypto.kem.ml_kem.MLKem768;
 const Certificate = crypto.Certificate;
 
 const hello = @import("hello.zig");
@@ -108,6 +109,9 @@ pub const HelloHook = struct {
 pub const Options = struct {
     /// 64 bytes of CSPRNG output: [0..32] ClientHello.random, [32..64] x25519 seed.
     entropy: [64]u8,
+    /// 64 more bytes of CSPRNG output to also offer X25519MLKEM768. Only the
+    /// seed is kept; the ML-KEM key pair is re-derived when the server picks it.
+    ml_kem_seed: ?[64]u8 = null,
     verifier: Verifier,
     /// Handshake reassembly buffer. Must hold the largest single handshake
     /// message (the Certificate chain); 8 KiB is plenty for REALITY's single
@@ -158,6 +162,9 @@ pub const Client = struct {
     opts: Options,
 
     x25519: X25519.KeyPair,
+    /// X25519MLKEM768 key_share payload (ML-KEM-768 ek || x25519 pk), valid
+    /// when `opts.ml_kem_seed` is set.
+    ml_kem_share: [MLKem768.PublicKey.encoded_length + 32]u8 = undefined,
     session_id: [32]u8 = undefined,
     session_id_len: u8 = 0,
     offered_suites: [16]tls.CipherSuite = undefined,
@@ -168,6 +175,8 @@ pub const Client = struct {
     sched384: ks.Sha384,
     sched: Schedule = undefined,
     suite: record.Suite = undefined,
+    /// Key exchange group the server selected.
+    group: tls.NamedGroup = undefined,
 
     // Fixed-size secret storage, used up to the suite's digest length.
     client_hs_secret: [max_digest]u8 = undefined,
@@ -186,13 +195,26 @@ pub const Client = struct {
     last_alert: ?tls.Alert = null,
 
     pub fn init(opts: Options) Client {
-        return .{
+        var c: Client = .{
             .opts = opts,
             .x25519 = X25519.KeyPair.generateDeterministic(opts.entropy[32..64].*),
             .sched256 = ks.Sha256.init(),
             .sched384 = ks.Sha384.init(),
             .reasm = handshake.Reassembler.init(opts.handshake_buf),
         };
+        if (opts.ml_kem_seed) |seed| {
+            // generateDeterministic only fails on a seed-derived non-canonical
+            // key, which cannot happen for ML-KEM key generation.
+            const kp = MLKem768.KeyPair.generateDeterministic(seed) catch unreachable;
+            c.ml_kem_share[0..MLKem768.PublicKey.encoded_length].* = kp.public_key.toBytes();
+            c.ml_kem_share[MLKem768.PublicKey.encoded_length..].* = c.x25519.public_key;
+        }
+        return c;
+    }
+
+    /// X25519MLKEM768 key_share payload, or null if not offered.
+    pub fn mlKemPublicKey(c: *const Client) ?[]const u8 {
+        return if (c.opts.ml_kem_seed != null) &c.ml_kem_share else null;
     }
 
     pub fn random(c: *const Client) *const [32]u8 {
@@ -376,10 +398,31 @@ pub const Client = struct {
         if (!offered) return error.IllegalSelection;
         c.suite = record.Suite.fromCipherSuite(sh.cipher_suite) orelse return error.IllegalSelection;
 
-        if (sh.key_share.group != .x25519) return error.IllegalSelection;
-        if (sh.key_share.public_key.len != X25519.public_length) return error.IllegalParameter;
-        const shared = X25519.scalarmult(c.x25519.secret_key, sh.key_share.public_key[0..32].*) catch
-            return error.WeakKeyShare;
+        c.group = sh.key_share.group;
+        var shared_buf: [MLKem768.shared_length + X25519.shared_length]u8 = undefined;
+        var shared: []const u8 = undefined;
+        switch (sh.key_share.group) {
+            .x25519 => {
+                if (sh.key_share.public_key.len != X25519.public_length) return error.IllegalParameter;
+                shared_buf[0..32].* = X25519.scalarmult(c.x25519.secret_key, sh.key_share.public_key[0..32].*) catch
+                    return error.WeakKeyShare;
+                shared = shared_buf[0..32];
+            },
+            .x25519_ml_kem768 => {
+                // Server sends ML-KEM ciphertext (1088) || x25519 public (32);
+                // shared secret is ML-KEM ss || x25519 ss (RFC draft-ietf-tls-ecdhe-mlkem).
+                const seed = c.opts.ml_kem_seed orelse return error.IllegalSelection;
+                const ctl = MLKem768.ciphertext_length;
+                if (sh.key_share.public_key.len != ctl + X25519.public_length) return error.IllegalParameter;
+                const kp = MLKem768.KeyPair.generateDeterministic(seed) catch unreachable;
+                shared_buf[0..MLKem768.shared_length].* = kp.secret_key.decaps(sh.key_share.public_key[0..ctl]) catch
+                    return error.IllegalParameter;
+                shared_buf[MLKem768.shared_length..].* = X25519.scalarmult(c.x25519.secret_key, sh.key_share.public_key[ctl..][0..32].*) catch
+                    return error.WeakKeyShare;
+                shared = &shared_buf;
+            },
+            else => return error.IllegalSelection,
+        }
 
         c.sched = switch (c.suite) {
             .aes_128_gcm_sha256, .chacha20_poly1305_sha256 => .{ .sha256 = c.sched256 },
@@ -390,7 +433,7 @@ pub const Client = struct {
         switch (c.sched) {
             inline else => |*k| {
                 const KS = @TypeOf(k.*);
-                k.setSharedSecret(&shared);
+                k.setSharedSecret(shared);
                 const hs = k.handshakeTraffic();
                 @memcpy(c.client_hs_secret[0..KS.digest_length], &hs.client);
                 @memcpy(c.server_hs_secret[0..KS.digest_length], &hs.server);
@@ -508,7 +551,7 @@ pub const Client = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Tests: replay the RFC 8448 §3 handshake deterministically.
+// Tests: replay the RFC 8448 ?3 handshake deterministically.
 
 const testing = std.testing;
 const rfc8448 = @import("testdata/rfc8448.zig");
