@@ -1,4 +1,4 @@
-﻿# zray
+# zray
 
 A minimal [REALITY](https://github.com/XTLS/REALITY) client (VLESS +
 `xtls-rprx-vision`) for home routers, written in Zig with no dependencies
@@ -10,7 +10,7 @@ connection slots allocated up front. Memory use is decided at startup and does
 not grow with traffic.
 
 Reference deployment: Xiaomi AC2100 (MT7621, MIPS 1004Kc, soft-float,
-ImmortalWrt 23.05) — 798 KB static binary, ~2.2 MB RSS with 64 slots, about
+ImmortalWrt 23.05) ? 798 KB static binary, ~2.2 MB RSS with 64 slots, about
 1.6 MB/s through the tunnel while the CPU does AES-GCM in software.
 
 ## What it does
@@ -82,12 +82,12 @@ inner connection presents.
 | `listen` | `127.0.0.1:1080` | SOCKS5 inbound. `""` disables it. |
 | `redirect` | `""` | Transparent inbound for `REDIRECT` rules. `""` disables it. At least one of `listen` / `redirect` must be set. |
 | `sniff` | `true` | Replace the destination IP with the TLS SNI / HTTP Host when present. |
-| `server` | — | REALITY server hostname or IP. Resolved once at startup. |
+| `server` | ? | REALITY server hostname or IP. Resolved once at startup. |
 | `port` | `443` | |
 | `sni` | `server` | SNI sent in the ClientHello (the camouflage site). |
-| `public_key` | — | Server `publicKey` (base64url, as in the share link). |
+| `public_key` | ? | Server `publicKey` (base64url, as in the share link). |
 | `short_id` | `""` | Hex, up to 8 bytes. |
-| `uuid` | — | VLESS user id. |
+| `uuid` | ? | VLESS user id. |
 | `max_connections` | `128` | Connection slots. Each slot is ~92 KiB, allocated at startup. |
 | `handshake_timeout_s` | `15` | TCP connect + TLS handshake deadline. |
 | `idle_timeout_s` | `600` | Close a relay with no traffic in either direction. |
@@ -165,3 +165,7 @@ Everything in `tls/` and `proxy/` is sans-I/O and unit tested
 - UDP payloads above roughly 600 bytes may be dropped depending on the server's
   outbound; DNS works, QUIC generally does not.
 - No log level control; every connection logs its lifecycle to stderr.
+
+## License
+
+[MIT](LICENSE).
