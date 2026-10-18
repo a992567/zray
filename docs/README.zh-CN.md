@@ -10,8 +10,19 @@
 确定，不随流量增长。
 
 参考部署：小米 AC2100（MT7621，MIPS 1004Kc，软浮点，ImmortalWrt 23.05）——
-静态二进制 798 KB，64 个槽位时 RSS 约 2.2 MB，CPU 软算 AES-GCM 时隧道吞吐
-约 1.6 MB/s。
+静态二进制 798 KB，64 个槽位时虚拟内存 7.3 MB、RSS 约 2.3 MB。在这台机器上
+经隧道从 speed.cloudflare.com 拉 50 MB 的实测（同一主机 WAN 直连为 1.3 MB/s）：
+
+| 路径                                  | 吞吐 | zray CPU（单个 1004Kc 线程） |
+|---------------------------------------|-----:|-----------------------------:|
+| HTTPS，Vision 已切到 direct 直拷        | 1.0–1.1 MB/s | 约 5 %              |
+| HTTP，留在外层 TLS 内（软算 AES-GCM）   | 1.0 MB/s | 约 64 %                 |
+| 3 路 HTTPS 并发                        | 合计 1.5 MB/s | 约 10 %            |
+
+瓶颈在链路而不在 CPU；这颗核软算 AES-GCM 的上限约 1.5 MB/s，这正是 Vision
+的 direct 直拷在这类设备上有意义的原因。
+
+![mir 上的吞吐实测](img/throughput-mir.png)
 
 ## 功能
 

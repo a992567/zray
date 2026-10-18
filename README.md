@@ -12,8 +12,20 @@ connection slots allocated up front. Memory use is decided at startup and does
 not grow with traffic.
 
 Reference deployment: Xiaomi AC2100 (MT7621, MIPS 1004Kc, soft-float,
-ImmortalWrt 23.05) ? 798 KB static binary, ~2.2 MB RSS with 64 slots, about
-1.6 MB/s through the tunnel while the CPU does AES-GCM in software.
+ImmortalWrt 23.05): 798 KB static binary, 7.3 MB VSZ / ~2.3 MB RSS with
+64 slots. Measured on that box, pulling 50 MB from speed.cloudflare.com
+through the tunnel (the WAN link itself does 1.3 MB/s to the same host):
+
+| Path                                   | Throughput | zray CPU (one 1004Kc thread) |
+|----------------------------------------|-----------:|-----------------------------:|
+| HTTPS, Vision switched to direct copy  | 1.0-1.1 MB/s | ~5 %                       |
+| HTTP, stays inside outer TLS (sw AES-GCM) | 1.0 MB/s | ~64 %                      |
+| 3 parallel HTTPS streams               | 1.5 MB/s aggregate | ~10 %              |
+
+The tunnel is link-bound, not CPU-bound; software AES-GCM on this core tops
+out around 1.5 MB/s, which is why Vision's direct copy matters here.
+
+![throughput on mir](docs/img/throughput-mir.png)
 
 ## What it does
 
