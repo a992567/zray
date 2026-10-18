@@ -9,6 +9,10 @@ failure accounting.
 Problems:
 - Server IP change (migration / DDNS) is never picked up until a manual restart.
 - Boot before DNS is usable -> process exits -> procd respawns every 5 s.
+  Partly addressed 2026-10-18: `bootstrap_dns` queries a public nameserver
+  directly (`proxy/dns.zig`, startup only, 3 x 2 s), so the local resolver
+  depending on the tunnel no longer deadlocks boot. Still exits if the WAN
+  itself is not up yet.
 - Only the first A record is used; no failover.
 - Upstream down -> every incoming client still does a full connect + waits for
   `handshake_timeout_s` (15 s), occupying a 92 KiB slot; 64 slots fill up with
@@ -19,7 +23,8 @@ Plan (~100-200 lines):
   `fail_streak`, `backoff_until`.
 - Periodic re-resolve from the 1 s tick (`resolve_interval_s`, default 300).
   Must be non-blocking: send a UDP A query to the nameserver from
-  `/etc/resolv.conf` on an epoll fd; minimal DNS response parser.
+  `/etc/resolv.conf` (or `bootstrap_dns`) on an epoll fd; reuse
+  `proxy/dns.zig` for the wire format.
 - On connect / handshake / `CertificateRejected` failure: `fail_streak += 1`,
   rotate to next A record; `fail_streak >= 3` triggers re-resolve;
   `backoff = min(1 s << streak, max_backoff_s)`.

@@ -13,6 +13,7 @@ comptime {
     _ = @import("proxy/socks5.zig");
     _ = @import("proxy/mux.zig");
     _ = @import("proxy/sniff.zig");
+    _ = @import("proxy/dns.zig");
     _ = @import("tls/fingerprint.zig");
 }
 

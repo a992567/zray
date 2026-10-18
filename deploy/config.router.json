@@ -4,6 +4,7 @@
   "sniff": true,
   "server": "example.com",
   "port": 2443,
+  "bootstrap_dns": "223.5.5.5",
   "sni": "example.com",
   "public_key": "<server publicKey, base64url>",
   "short_id": "",

@@ -81,6 +81,7 @@ zig build probe -- 203.0.113.5 443 example.com K5Ko4T...4G8 - \
 | `sniff` | `true` | 有 TLS SNI / HTTP Host 时用它替换目标 IP。 |
 | `server` | — | REALITY 服务器域名或 IP。启动时解析一次。 |
 | `port` | `443` | |
+| `bootstrap_dns` | `""` | 启动时用来解析 `server` 的 DNS 服务器（`ip` 或 `ip:port`），直接走 UDP 查询，绕过 `/etc/resolv.conf`。本地解析器自身要经过隧道时设置它，避免开机时两个服务互相等待。失败时回退到系统解析器。 |
 | `sni` | 同 `server` | ClientHello 里的 SNI（伪装站点）。 |
 | `public_key` | — | 服务端 `publicKey`（base64url，与分享链接一致）。 |
 | `short_id` | `""` | 十六进制，最多 8 字节。 |
@@ -120,7 +121,9 @@ table inet gfw {
 ```
 
 务必保证 REALITY 服务器自己的 IP 永远不会进这个集合，并且用来解析 `server`
-的解析器本身不依赖这条隧道。
+的解析器本身不依赖这条隧道。如果它确实依赖（比如 chinadns-ng 或 dnsmasq 的
+DoT 上游走 zray），把 `bootstrap_dns` 设成一个公共 DNS，启动时的解析就完全
+不经过本地解析器。
 
 ## 目录结构
 

@@ -88,6 +88,7 @@ inner connection presents.
 | `sniff` | `true` | Replace the destination IP with the TLS SNI / HTTP Host when present. |
 | `server` | ? | REALITY server hostname or IP. Resolved once at startup. |
 | `port` | `443` | |
+| `bootstrap_dns` | `""` | Nameserver (`ip` or `ip:port`) asked directly over UDP to resolve `server` at startup, bypassing `/etc/resolv.conf`. Set it when the local resolver itself goes through the tunnel, so the two services do not wait on each other at boot. Falls back to the system resolver on failure. |
 | `sni` | `server` | SNI sent in the ClientHello (the camouflage site). |
 | `public_key` | ? | Server `publicKey` (base64url, as in the share link). |
 | `short_id` | `""` | Hex, up to 8 bytes. |
@@ -128,7 +129,10 @@ table inet gfw {
 ```
 
 Make sure the REALITY server's own IP never ends up in that set, and that the
-resolver used to look up `server` does not itself depend on the tunnel.
+resolver used to look up `server` does not itself depend on the tunnel. If it
+does (chinadns-ng or dnsmasq forwarding over DoT through zray), set
+`bootstrap_dns` to a public nameserver so startup resolution never touches the
+local resolver.
 
 ## Layout
 

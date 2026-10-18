@@ -20,6 +20,12 @@ const FileConfig = struct {
     sniff: bool = true,
     server: []const u8,
     port: u16 = 443,
+    /// Nameserver ("1.2.3.4", "1.2.3.4:53", "[2001:db8::1]:53") queried
+    /// directly over UDP to resolve `server` at startup, bypassing
+    /// /etc/resolv.conf. Set it when the local resolver (chinadns-ng,
+    /// dnsmasq + DoT, ...) itself routes through this tunnel, otherwise the
+    /// two services wait on each other at boot. Empty: system resolver.
+    bootstrap_dns: []const u8 = "",
     sni: []const u8 = "",
     public_key: []const u8,
     short_id: []const u8 = "",
@@ -63,7 +69,7 @@ fn linuxMain(init: std.process.Init) !void {
     };
 
     // Resolve the server once at startup (routers rarely change upstreams).
-    const server_addr = resolve(init.io, parsed.server, parsed.port) catch |e| {
+    const server_addr = resolveServer(init.io, parsed.server, parsed.port, parsed.bootstrap_dns) catch |e| {
         sys.log("cannot resolve {s}: {s}", .{ parsed.server, @errorName(e) });
         return e;
     };
@@ -152,9 +158,72 @@ fn listenOn(spec: []const u8) !@import("linux/sys.zig").fd_t {
 }
 
 /// IP literal or DNS name -> socket address (blocking, startup only).
-fn resolve(io: Io, host: []const u8, port: u16) !@import("linux/sys.zig").SockAddr {
+/// With `bootstrap_dns` set, that nameserver is asked first; the system
+/// resolver is only a fallback.
+fn resolveServer(io: Io, host: []const u8, port: u16, bootstrap_dns: []const u8) !@import("linux/sys.zig").SockAddr {
     const sys = @import("linux/sys.zig");
     if (sys.SockAddr.parseIp(host, port)) |a| return a else |_| {}
+    if (bootstrap_dns.len > 0) {
+        const ns = parseHostPort(bootstrap_dns, 53) catch {
+            sys.log("bad bootstrap_dns {s}", .{bootstrap_dns});
+            return error.BadBootstrapDns;
+        };
+        if (resolveVia(ns, host, port)) |a| {
+            return a;
+        } else |e| {
+            sys.log("bootstrap_dns {s}: cannot resolve {s}: {s}; trying system resolver", .{ bootstrap_dns, host, @errorName(e) });
+        }
+    }
+    return resolveSystem(io, host, port);
+}
+
+/// "ip", "ip:port" or "[ip6]:port".
+fn parseHostPort(spec: []const u8, default_port: u16) !@import("linux/sys.zig").SockAddr {
+    const sys = @import("linux/sys.zig");
+    if (spec.len > 0 and spec[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, spec, ']') orelse return error.BadAddress;
+        const rest = spec[close + 1 ..];
+        if (rest.len == 0) return sys.SockAddr.parseIp(spec[1..close], default_port);
+        if (rest[0] != ':') return error.BadAddress;
+        return sys.SockAddr.parseIp(spec[1..close], try std.fmt.parseInt(u16, rest[1..], 10));
+    }
+    // One colon: v4:port. None or several: bare v4 / v6 literal.
+    if (std.mem.count(u8, spec, ":") == 1) {
+        const colon = std.mem.indexOfScalar(u8, spec, ':').?;
+        return sys.SockAddr.parseIp(spec[0..colon], try std.fmt.parseInt(u16, spec[colon + 1 ..], 10));
+    }
+    return sys.SockAddr.parseIp(spec, default_port);
+}
+
+/// Blocking A lookup straight at `ns` over UDP: 3 attempts, 2 s each.
+fn resolveVia(ns: @import("linux/sys.zig").SockAddr, host: []const u8, port: u16) !@import("linux/sys.zig").SockAddr {
+    const sys = @import("linux/sys.zig");
+    const dns = @import("proxy/dns.zig");
+    const fd = try sys.udpSocket(ns.family());
+    defer sys.close(fd);
+    var query: [dns.max_message]u8 = undefined;
+    var reply: [dns.max_message]u8 = undefined;
+    var attempt: usize = 0;
+    while (attempt < 3) : (attempt += 1) {
+        var id_bytes: [2]u8 = undefined;
+        sys.randomBytes(&id_bytes);
+        const id = std.mem.readInt(u16, &id_bytes, .big);
+        const qlen = try dns.encodeQuery(&query, id, host);
+        _ = try sys.sendTo(fd, query[0..qlen], &ns);
+        if (!try sys.pollIn(fd, 2000)) continue;
+        const d = sys.recvFrom(fd, &reply) catch continue;
+        const ip = dns.firstA(reply[0..d.len], id) catch |e| switch (e) {
+            error.WrongId => continue,
+            else => return e,
+        };
+        sys.log("resolved {s} -> {d}.{d}.{d}.{d} via bootstrap_dns", .{ host, ip[0], ip[1], ip[2], ip[3] });
+        return sys.SockAddr.fromIpv4(ip, port);
+    }
+    return error.Timeout;
+}
+
+fn resolveSystem(io: Io, host: []const u8, port: u16) !@import("linux/sys.zig").SockAddr {
+    const sys = @import("linux/sys.zig");
     const hn = try Io.net.HostName.init(host);
     var buf: [16]Io.net.HostName.LookupResult = undefined;
     var q: Io.Queue(Io.net.HostName.LookupResult) = .init(&buf);

@@ -119,6 +119,17 @@ pub fn sendTo(fd: fd_t, buf: []const u8, to: *const SockAddr) Error!usize {
     return check(linux.sendto(fd, buf.ptr, buf.len, 0, to.ptr(), to.len()));
 }
 
+/// Block until `fd` is readable or `timeout_ms` elapses (startup helpers
+/// only; the event loop uses epoll). Returns false on timeout.
+pub fn pollIn(fd: fd_t, timeout_ms: i32) Error!bool {
+    var fds = [_]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN }};
+    const n = check(linux.poll(&fds, 1, timeout_ms)) catch |e| switch (e) {
+        error.Interrupted => return false,
+        else => return e,
+    };
+    return n > 0;
+}
+
 pub fn setsockoptInt(fd: fd_t, level: i32, opt: u32, value: i32) Error!void {
     _ = try check(linux.setsockopt(fd, level, opt, @ptrCast(&value), @sizeOf(i32)));
 }
