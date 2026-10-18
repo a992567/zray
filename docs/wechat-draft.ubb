@@ -1,0 +1,48 @@
+[size=5][b]我给路由器写了一个 800 KB 的代理客户端[/b][/size]
+
+[size=4][b]开端[/b][/size]
+
+家里那台小米 AC2100，刷了 ImmortalWrt，安稳地当了几年的上网工具。一开始我是想让其运行 xray 工具的，因为我的服务器上的代理工具使用的 VLESS 协议，使用 xray 是目前流行的解决方案。但是我将其安装上之后，路由器直接卡死了，我一开始以为是 xray 本身有问题，于是又试了一圈其他的 VLESS 协议的程序，无一例外全部卡死，而且卡死后路由器必须得重启才能使用。
+
+当时查了一下，如果想使用代理软件的话，目前资源最低的就是 trojan 协议，于是我把 go-trojan 安装到路由器中，果然能正常运行了。我以为这就是完美方案了，没有想到这只是趟坑的序幕，接下来几天，我发现会时不时的上不了网，一开始我还以为是运营商的问题，没有在意，然后出的问题多了，我就忍不了了，开始把怀疑对象转到了我的路由器身上。
+
+我首先 ping 了一下路由器网关，果然 ping 值不对劲，看来是路由器负载过高了，但是要找到问题，必须得确定是哪个进程导致的。于是我直接 SSH 进入路由器后台，使用 top 命令就盯着它看。当时 ai 也没有这么智能，只能人工来观测。
+
+经过我的不懈努力，终于抓住了一个 CPU 飙升的瞬间。
+
+[img]https://cdn.jsdelivr.net/gh/yunnysunny/zray@master/docs/images/trojan-cpu.png[/img]
+
+通过图片，貌似是系统的网络卡住了，cpu 的 io 比较高，同时 sys 也比较高。trojan-go 虽然也占用 CPU ，但是不像是主因，然后我就丈二的金刚摸不着头脑了。又过了几天实在忍无可忍了，想到这些天也就增加了一个 trojan-go，干脆死马当活马医，先把它下掉。没有想到拿掉它后，路由器不卡了！
+
+又过了些天，我还是不死心，一定要将我花 40 元大洋买的路由器利用上，在网上又查了一下，找了一篇关于 golang 在 mips 设备上的兼容性的 github issue 描述 [url=https://github.com/golang/go/issues/39174]Abnormal memory usage on MIPS platform with GOMIPS=softfloat · Issue #39174 · golang/go[/url] 。原来 golang GC 时也需要耗费一定的资源，但是 mips 硬件资源低，会导致系统 CPU 使用量飙升。看样子跟我的症状比较吻合，于是按照 issue 中的解决思路，使用 [font=Consolas]ulimit -v 32768[/font] 命令限制 golang 虚拟内存大小，不让它 GC 大块的内存。同时设置环境变量 [font=Consolas]GOMAXPROCS=2[/font] ，约束其 CPU 使用的核心数上限。
+
+经过上述一番操作后，没有想到之前路由器的 CPU 飙升的问题就得以解决了！
+
+[size=4][b]升级[/b][/size]
+
+虽然我的路由看上去已经是完美的方案了，但是它毕竟是 trojan 协议，手里面的 VLESS 协议的服务它是用不上的。现在已经进入了氛围编程阶段，以前耗费大量时间才能完成的事情，现在可能一两天就能搞定了。我何不使用氛围编程复刻一个轻量的 VLESS 协议的客户端呢？说干就干，反正不是我干。
+
+我想要的东西其实很窄。协议只要 REALITY 加 VLESS 加 Vision，这是我服务端已经在用的。入口只要 SOCKS5 和透明 REDIRECT。内存要在启动的时候就定死，之后不涨，宁可拒绝连接也不要去申请新内存。单线程，一个 epoll 循环就够，反正只有一个核。
+
+[img]https://cdn.jsdelivr.net/gh/yunnysunny/zray@master/docs/images/topology.png[/img]
+
+用 Zig 写。
+
+Zig 对于嵌入式来说是一门完美的语言，没有 runtime、没有 GC，打出来的包个头小，启动后占用内存低。而且其对于低端 mips 设备的支持完整，编程语言的安全性也比 C 要强很多。总之是解决当前场景的最优方案。
+
+我给它起名 zray，然后就开始写了。
+
+由于是氛围编程，这里就不透露技术细节了。但是有一点需要注意由于牵扯到网络加密相关的技术，如果你直接使用 Claude Code 工具化，它会拒绝编写代码，认为你是在做有风险的事情，你通过修改提示词并不能瞒过他，所以这种事情还是要交给第三方 Agent 来做。
+
+写完后，交叉编译出来版本，让 Agent 直接 ssh 到路由器上测试即可。
+
+最终成功还是喜人的，编译出来的文件只有 800KB，是 trojan-go（13MB）的十六分之一，比起 34MB 的 xray 更是小了将近两个数量级。运行起来的话，虚拟内存只有 7MB，比起 18 MB 的 trojan-go 来说也只有其一半不到。关键是我要求其使用连接池和上游服务进行通信，总体内存是可控的。
+
+[img]https://cdn.jsdelivr.net/gh/yunnysunny/zray@master/docs/images/size-compare.png[/img]
+
+[img]https://cdn.jsdelivr.net/gh/yunnysunny/zray@master/docs/images/zray-top.png[/img]
+
+[quote]代码放在 GitHub，[url=https://github.com/yunnysunny/zray]yunnysunny/zray[/url]，MIT 协议。README 有中文版。预编译的二进制覆盖 mipsel、mips、aarch64、armv7、x86_64，都是静态 musl，scp 到路由器就能跑。[/quote]
+
+如果你家里也有一台老路由器，CPU 也跟我的小米 AC2100 一样是联发科 7621 ，不要扔，它还能发挥余热。
+[quote]像小米路由器 3G / 4A 千兆版、红米 AC2100、新路由 3（Newifi D2）、斐讯 K2P、网件 R6220 都是联发科 7621 的。[/quote]
