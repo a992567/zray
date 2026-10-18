@@ -9,7 +9,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 
-pub const version = "0.1.0";
+pub const version = "0.2.0";
 
 const FileConfig = struct {
     /// SOCKS5 inbound; empty string disables it.
