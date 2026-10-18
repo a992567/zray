@@ -22,7 +22,7 @@
 瓶颈在链路而不在 CPU；这颗核软算 AES-GCM 的上限约 1.5 MB/s，这正是 Vision
 的 direct 直拷在这类设备上有意义的原因。
 
-![mir 上的吞吐实测](img/throughput-mir.png)
+![mir 上的吞吐实测](images/throughput-mir.png)
 
 ## 功能
 

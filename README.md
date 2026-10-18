@@ -25,7 +25,7 @@ through the tunnel (the WAN link itself does 1.3 MB/s to the same host):
 The tunnel is link-bound, not CPU-bound; software AES-GCM on this core tops
 out around 1.5 MB/s, which is why Vision's direct copy matters here.
 
-![throughput on mir](docs/img/throughput-mir.png)
+![throughput on mir](docs/images/throughput-mir.png)
 
 ## What it does
 
