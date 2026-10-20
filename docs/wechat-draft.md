@@ -24,9 +24,7 @@
 
 我想要的东西其实很窄。协议只要 REALITY 加 VLESS 加 Vision，这是我服务端已经在用的。入口只要 SOCKS5 和透明 REDIRECT。内存要在启动的时候就定死，之后不涨，宁可拒绝连接也不要去申请新内存。单线程，一个 epoll 循环就够，反正只有一个核。
 
-![](https://cdn.jsdelivr.net/gh/yunnysunny/zray@master/docs/images/topology.png)
-
-用 Zig 写。
+**用 Zig 写**
 
 Zig 对于嵌入式来说是一门完美的语言，没有 runtime、没有 GC，打出来的包个头小，启动后占用内存低。而且其对于低端 mips 设备的支持完整，编程语言的安全性也比 C 要强很多。总之是解决当前场景的最优方案。
 
@@ -41,6 +39,8 @@ Zig 对于嵌入式来说是一门完美的语言，没有 runtime、没有 GC�
 ![](https://cdn.jsdelivr.net/gh/yunnysunny/zray@master/docs/images/size-compare.png)
 
 ![](https://cdn.jsdelivr.net/gh/yunnysunny/zray@master/docs/images/zray-top.png)
+
+**测试一下速**
 
 速度也不拖后腿。在路由器上经隧道拉 50 MB 文件，HTTPS 流量能跑到 9 到 10 MB/s，zray 只占一个核的 17% 左右；而同一个文件不走隧道直接从 WAN 下载反而只有 1.4 MB/s，慢的是运营商的国际出口。HTTP 流量就差远了，被 CPU 卡在 1.5 MB/s。同一条隧道，为什么差这么多？这要从 Vision 的设计说起。
 
