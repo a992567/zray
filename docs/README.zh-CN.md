@@ -10,17 +10,24 @@
 确定，不随流量增长。
 
 参考部署：小米 AC2100（MT7621，MIPS 1004Kc，软浮点，ImmortalWrt 23.05）——
-静态二进制 798 KB，64 个槽位时虚拟内存 7.3 MB、RSS 约 2.3 MB。在这台机器上
-经隧道从 speed.cloudflare.com 拉 50 MB 的实测（同一主机 WAN 直连为 1.3 MB/s）：
+静态二进制 802 KB，64 个槽位时虚拟内存 7.3 MB、RSS 约 2.2 MB。在这台机器上
+经隧道连接日本的 REALITY 服务器（RTT 约 110 ms）拉取 50 MB 的实测：
 
 | 路径                                  | 吞吐 | zray CPU（单个 1004Kc 线程） |
 |---------------------------------------|-----:|-----------------------------:|
-| HTTPS，Vision 已切到 direct 直拷        | 1.0–1.1 MB/s | 约 5 %              |
-| HTTP，留在外层 TLS 内（软算 AES-GCM）   | 1.0 MB/s | 约 64 %                 |
-| 3 路 HTTPS 并发                        | 合计 1.5 MB/s | 约 10 %            |
+| HTTPS，Vision 已切到 direct 直拷        | 9–10 MB/s | 约 17 %                 |
+| HTTP，留在外层 TLS 内（软算 AES-GCM）   | 1.5 MB/s | 约 98 %                  |
+| 3 路 HTTPS 并发                        | 合计 10 MB/s | 约 55 %              |
 
-瓶颈在链路而不在 CPU；这颗核软算 AES-GCM 的上限约 1.5 MB/s，这正是 Vision
-的 direct 直拷在这类设备上有意义的原因。
+同一主机不走隧道、由 WAN 直连只有 1.4 MB/s，慢的是运营商的国际出口。走隧道的
+HTTPS 受服务器链路限制；HTTP 无法脱离外层 TLS，受 CPU 限制——这颗核软算
+AES-GCM 的上限约 1.5 MB/s，这正是 Vision 的 direct 直拷在这类设备上有意义的原因。
+
+这类设备有一个内核参数需要留意：128 MB 内存下 `net.ipv4.tcp_rmem` 的默认上限
+约 930 KB，单条流的吞吐被限制在大约“窗口 / RTT”，190 ms 时约 1 MB/s。把上限
+调高（例如在 `/etc/sysctl.d/` 里写 `net.ipv4.tcp_rmem = 4096 131072 4194304`）
+之后，上表的 HTTPS 数字才从约 1 MB/s 提升到现在的水平。不要用 `sock_buf` 来
+解决这个问题：它会关掉内核的自动调优，而且会被 `net.core.rmem_max` 截断。
 
 ![mir 上的吞吐实测](images/throughput-mir.png)
 

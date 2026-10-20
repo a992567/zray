@@ -12,18 +12,29 @@ connection slots allocated up front. Memory use is decided at startup and does
 not grow with traffic.
 
 Reference deployment: Xiaomi AC2100 (MT7621, MIPS 1004Kc, soft-float,
-ImmortalWrt 23.05): 798 KB static binary, 7.3 MB VSZ / ~2.3 MB RSS with
-64 slots. Measured on that box, pulling 50 MB from speed.cloudflare.com
-through the tunnel (the WAN link itself does 1.3 MB/s to the same host):
+ImmortalWrt 23.05): 802 KB static binary, 7.3 MB VSZ / ~2.2 MB RSS with
+64 slots. Measured on that box against a REALITY server in Japan (~110 ms
+RTT), pulling 50 MB through the tunnel:
 
-| Path                                   | Throughput | zray CPU (one 1004Kc thread) |
-|----------------------------------------|-----------:|-----------------------------:|
-| HTTPS, Vision switched to direct copy  | 1.0-1.1 MB/s | ~5 %                       |
-| HTTP, stays inside outer TLS (sw AES-GCM) | 1.0 MB/s | ~64 %                      |
-| 3 parallel HTTPS streams               | 1.5 MB/s aggregate | ~10 %              |
+| Path                                      | Throughput | zray CPU (one 1004Kc thread) |
+|-------------------------------------------|-----------:|-----------------------------:|
+| HTTPS, Vision switched to direct copy     | 9-10 MB/s  | ~17 %                        |
+| HTTP, stays inside outer TLS (sw AES-GCM) | 1.5 MB/s   | ~98 %                        |
+| 3 parallel HTTPS streams                  | 10 MB/s aggregate | ~55 %                 |
 
-The tunnel is link-bound, not CPU-bound; software AES-GCM on this core tops
-out around 1.5 MB/s, which is why Vision's direct copy matters here.
+The same host fetched directly over the WAN, without the tunnel, does
+1.4 MB/s: the ISP's international path is the slow part. HTTPS through the
+tunnel is bound by the server link; HTTP, which cannot leave the outer TLS,
+is CPU-bound, since software AES-GCM on this core tops out around 1.5 MB/s.
+That is why Vision's direct copy matters here.
+
+One kernel knob matters on a box like this: the default `net.ipv4.tcp_rmem`
+ceiling with 128 MB of RAM is about 930 KB, which caps a single stream at
+roughly window / RTT, about 1 MB/s at 190 ms. Raising the ceiling (for
+example `net.ipv4.tcp_rmem = 4096 131072 4194304` in `/etc/sysctl.d/`)
+lifted the HTTPS numbers above from ~1 MB/s to what the table shows. Do not
+set `sock_buf` for this; it disables the kernel's autotuning and is clamped
+by `net.core.rmem_max`.
 
 ![throughput on mir](docs/images/throughput-mir.png)
 
