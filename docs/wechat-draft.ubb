@@ -42,6 +42,12 @@ Zig 对于嵌入式来说是一门完美的语言，没有 runtime、没有 GC�
 
 [img]https://cdn.jsdelivr.net/gh/yunnysunny/zray@master/docs/images/zray-top.png[/img]
 
+速度也不拖后腿。在路由器上经隧道拉 50 MB 文件，HTTPS 流量能跑到 9 到 10 MB/s，zray 只占一个核的 17% 左右；而同一个文件不走隧道直接从 WAN 下载反而只有 1.4 MB/s，慢的是运营商的国际出口。HTTP 流量因为没法脱离外层 TLS，要在这颗没有 AES 指令的 MIPS 核上软算 AES-GCM，被 CPU 卡在 1.5 MB/s，这也正是 Vision 这种"握手后直拷"的设计在低端设备上的意义。
+
+这里还踩了一个坑：刚部署完实测只有 1 MB/s，查了半天 zray 的代码一无所获，抓包才发现是路由器内核给 TCP 接收缓冲设的默认上限只有 930 KB（128 MB 内存的机器就这么算的），再乘上 190 ms 的 RTT，单条流的理论上限就是 1 MB/s 左右。在 [font=Consolas]/etc/sysctl.d/[/font] 里把 [font=Consolas]net.ipv4.tcp_rmem[/font] 的上限调到 4 MB，速度直接翻了几倍。跟程序没关系，但这种坑不踩一次是不会知道的。
+
+[img]https://cdn.jsdelivr.net/gh/yunnysunny/zray@master/docs/images/throughput-mir.png[/img]
+
 [quote]代码放在 GitHub，[url=https://github.com/yunnysunny/zray]yunnysunny/zray[/url]，MIT 协议。README 有中文版。预编译的二进制覆盖 mipsel、mips、aarch64、armv7、x86_64，都是静态 musl，scp 到路由器就能跑。[/quote]
 
 如果你家里也有一台老路由器，CPU 也跟我的小米 AC2100 一样是联发科 7621 ，不要扔，它还能发挥余热。
