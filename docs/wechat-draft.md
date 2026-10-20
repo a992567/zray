@@ -10,7 +10,7 @@
 
 经过我的不懈努力，终于抓住了一个 CPU 飙升的瞬间。
 
-![](images/trojan-cpu.png)
+![](https://cdn.jsdelivr.net/gh/yunnysunny/zray@master/docs/images/trojan-cpu.png)
 
 通过图片，貌似是系统的网络卡住了，cpu 的 io 比较高，同时 sys 也比较高。trojan-go 虽然也占用 CPU ，但是不像是主因，然后我就丈二的金刚摸不着头脑了。又过了几天实在忍无可忍了，想到这些天也就增加了一个 trojan-go，干脆死马当活马医，先把它下掉。没有想到拿掉它后，路由器不卡了！
 
@@ -24,7 +24,7 @@
 
 我想要的东西其实很窄。协议只要 REALITY 加 VLESS 加 Vision，这是我服务端已经在用的。入口只要 SOCKS5 和透明 REDIRECT。内存要在启动的时候就定死，之后不涨，宁可拒绝连接也不要去申请新内存。单线程，一个 epoll 循环就够，反正只有一个核。
 
-![](images/topology.png)
+![](https://cdn.jsdelivr.net/gh/yunnysunny/zray@master/docs/images/topology.png)
 
 用 Zig 写。
 
@@ -38,9 +38,9 @@ Zig 对于嵌入式来说是一门完美的语言，没有 runtime、没有 GC�
 
 最终成功还是喜人的，编译出来的文件只有 800KB，是 trojan-go（13MB）的十六分之一，比起 34MB 的 xray 更是小了将近两个数量级。运行起来的话，虚拟内存只有 7MB，比起 18 MB 的 trojan-go 来说也只有其一半不到。关键是我要求其使用连接池和上游服务进行通信，总体内存是可控的。
 
-![](images/size-compare.png)
+![](https://cdn.jsdelivr.net/gh/yunnysunny/zray@master/docs/images/size-compare.png)
 
-![](images/zray-top.png)
+![](https://cdn.jsdelivr.net/gh/yunnysunny/zray@master/docs/images/zray-top.png)
 
 速度也不拖后腿。在路由器上经隧道拉 50 MB 文件，HTTPS 流量能跑到 9 到 10 MB/s，zray 只占一个核的 17% 左右；而同一个文件不走隧道直接从 WAN 下载反而只有 1.4 MB/s，慢的是运营商的国际出口。HTTP 流量就差远了，被 CPU 卡在 1.5 MB/s。同一条隧道，为什么差这么多？这要从 Vision 的设计说起。
 
@@ -52,7 +52,7 @@ Vision 的办法是避开二次加密。你访问的是 HTTPS 网站时，数据
 
 这里还踩了一个坑：刚部署完实测只有 1 MB/s，查了半天 zray 的代码一无所获，抓包才发现是路由器内核给 TCP 接收缓冲设的默认上限只有 930 KB（128 MB 内存的机器就这么算的），再乘上 190 ms 的 RTT，单条流的理论上限就是 1 MB/s 左右。在 `/etc/sysctl.d/` 里把 `net.ipv4.tcp_rmem` 的上限调到 4 MB，速度直接翻了几倍。跟程序没关系，但这种坑不踩一次是不会知道的。
 
-![](images/throughput-mir.png)
+![](https://cdn.jsdelivr.net/gh/yunnysunny/zray@master/docs/images/throughput-mir.png)
 
 > 代码放在 GitHub，[yunnysunny/zray](https://github.com/yunnysunny/zray)，MIT 协议。README 有中文版。预编译的二进制覆盖 mipsel、mips、aarch64、armv7、x86_64，都是静态 musl，scp 到路由器就能跑。
 
