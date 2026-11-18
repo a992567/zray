@@ -1811,3 +1811,242 @@ test "HTTP rewrite has headroom when headers and POST body fill the first read" 
     try std.testing.expectEqual(@as(u64, 40000 - (client_chunk - original.len)), c.http_body.remaining);
     try std.testing.expect(mem.startsWith(u8, c.cin[0..c.cin_len], "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 40000\r\nConnection: close\r\n\r\n"));
 }
+
+const RouteKind = enum { domain, sniffed_ip, http_connect };
+
+/// One live routing attempt. Index 0 is the default outbound ("japan");
+/// 1 and 2 are the exit group for `ai.example.test`. A `false` entry in `up`
+/// is bound on 127.0.0.1 but not listening, so that member's connect fails
+/// with ECONNREFUSED. Nothing is resolved and no socket leaves the host.
+const RouteCase = struct {
+    host: []const u8,
+    kind: RouteKind,
+    up: [3]bool,
+    backoff: [3]bool = .{ false, false, false },
+    /// null: the client connection must close. Otherwise the outbound index
+    /// whose TCP handshake must be the only one that completes.
+    dials: ?u8,
+    tried: u16,
+};
+
+fn writeRouteRequest(out: []u8, kind: RouteKind, host: []const u8) !usize {
+    switch (kind) {
+        .domain => {
+            if (host.len == 0 or host.len > 255 or out.len < 10 + host.len) return error.BufferTooSmall;
+            out[0..3].* = .{ 5, 1, 0 };
+            out[3..8].* = .{ 5, 1, 0, 3, @intCast(host.len) };
+            @memcpy(out[8..][0..host.len], host);
+            mem.writeInt(u16, out[8 + host.len ..][0..2], 443, .big);
+            return 10 + host.len;
+        },
+        .sniffed_ip => {
+            // SOCKS target is an IP; the following HTTP request is what sniff
+            // must recover. 203.0.113.10 is documentation space and is never dialed.
+            out[0..3].* = .{ 5, 1, 0 };
+            out[3..11].* = .{ 5, 1, 0, 1, 203, 0, 113, 10 };
+            mem.writeInt(u16, out[11..13], 443, .big);
+            const rest = try std.fmt.bufPrint(out[13..], "GET / HTTP/1.1\r\nHost: {s}\r\n\r\n", .{host});
+            return 13 + rest.len;
+        },
+        .http_connect => {
+            const req = try std.fmt.bufPrint(out, "CONNECT {s}:443 HTTP/1.1\r\nHost: {s}:443\r\n\r\n", .{ host, host });
+            return req.len;
+        },
+    }
+}
+
+fn routeCase(spec: RouteCase) !void {
+    const linux = std.os.linux;
+    var nodes = [_]sys.fd_t{ -1, -1, -1 };
+    defer for (nodes) |fd| if (fd >= 0) sys.close(fd);
+    var addrs: [3]sys.SockAddr = undefined;
+    for (spec.up, 0..) |listen_ok, i| {
+        const fd = try sys.tcpSocket(linux.AF.INET);
+        nodes[i] = fd;
+        const local = sys.SockAddr.fromIpv4(.{ 127, 0, 0, 1 }, 0);
+        try sys.bind(fd, &local);
+        if (listen_ok) try sys.listen(fd, 4);
+        addrs[i] = try sys.localAddr(fd);
+    }
+
+    const obs = [_]Outbound{
+        .{ .tag = "japan", .addr = addrs[0], .sni = "japan.example.test", .uuid = @splat(1) },
+        .{ .tag = "exit-a", .addr = addrs[1], .sni = "exit-a.example.test", .uuid = @splat(2) },
+        .{ .tag = "exit-b", .addr = addrs[2], .sni = "exit-b.example.test", .uuid = @splat(3) },
+    };
+    const suffixes = [_][]const u8{"ai.example.test"};
+    const exit_group = [_]u8{ 1, 2 };
+    const default_group = [_]u8{0};
+    const rules = [_]Rule{.{ .suffixes = &suffixes, .group = &exit_group }};
+    const cfg: Config = .{
+        .outbounds = &obs,
+        .rules = &rules,
+        .default_group = &default_group,
+        .fail_backoff_s = 30,
+        .sniff = true,
+    };
+
+    const ep = try sys.epollCreate();
+    defer sys.close(ep);
+    var pair: [2]sys.fd_t = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0, &pair)));
+    defer sys.close(pair[1]);
+
+    var conns: [1]Conn = undefined;
+    var loop = Loop.init(ep, &cfg, &conns);
+    loop.accept(pair[0], .socks5, null);
+    const c = &conns[0];
+    defer if (c.state != .free) loop.close(c, "test finished");
+    try std.testing.expect(c.state != .free);
+
+    const preset = sys.monotonicSeconds() + 3600;
+    for (spec.backoff, 0..) |on, i| {
+        if (on) loop.bad_until[i] = preset;
+    }
+
+    var req: [256]u8 = undefined;
+    const req_len = try writeRouteRequest(&req, spec.kind, spec.host);
+    try std.testing.expectEqual(req_len, try sys.write(pair[1], req[0..req_len]));
+
+    for (0..25) |_| {
+        if (c.state == .free or c.state == .tls_handshake) break;
+        var events: [8]sys.Event = undefined;
+        const n = try sys.epollWait(ep, &events, 100);
+        for (events[0..n]) |ev| loop.handle(ev.data.u64, ev.events);
+    }
+    if ((spec.dials == null) != (c.state == .free)) {
+        std.debug.print("route {s} via {s}: state={s} ob={d} tries={d} mask={d}\n", .{
+            spec.host, @tagName(spec.kind), @tagName(c.state), c.ob, c.tries, c.tried_mask,
+        });
+    }
+
+    const want_group = if (domainMatch(spec.host, suffixes[0])) &exit_group else &default_group;
+    try std.testing.expectEqual(want_group.ptr, c.group.ptr);
+    try std.testing.expectEqual(want_group.len, c.group.len);
+    try std.testing.expectEqual(spec.tried, c.tried_mask);
+    try std.testing.expectEqual(@as(u8, @intCast(@popCount(spec.tried))), c.tries);
+    if (spec.dials) |idx| {
+        try std.testing.expectEqual(State.tls_handshake, c.state);
+        try std.testing.expectEqual(idx, c.ob);
+        try std.testing.expectEqual(addrs[idx].getPort(), (try sys.peerAddr(c.up_fd)).getPort());
+        try std.testing.expectEqual(@as(usize, 1), loop.active);
+    } else {
+        try std.testing.expectEqual(State.free, c.state);
+        try std.testing.expectEqual(@as(usize, 0), loop.active);
+    }
+
+    const now = sys.monotonicSeconds();
+    for (0..3) |i| {
+        const bit: u16 = @as(u16, 1) << @intCast(i);
+        const tried = spec.tried & bit != 0;
+        const succeeded = if (spec.dials) |idx| idx == i else false;
+        if (succeeded) {
+            try std.testing.expectEqual(@as(u64, 0), loop.bad_until[i]);
+        } else if (tried) {
+            try std.testing.expect(loop.bad_until[i] > now);
+            if (spec.backoff[i]) try std.testing.expect(loop.bad_until[i] != preset);
+        } else if (spec.backoff[i]) {
+            try std.testing.expectEqual(preset, loop.bad_until[i]);
+        } else try std.testing.expectEqual(@as(u64, 0), loop.bad_until[i]);
+    }
+
+    // The completed handshake is queued on exactly one listener.
+    for (spec.up, 0..) |listen_ok, i| {
+        if (!listen_ok) continue;
+        const queued = try sys.pollIn(nodes[i], 30);
+        const wanted = if (spec.dials) |idx| idx == i else false;
+        try std.testing.expectEqual(wanted, queued);
+        if (queued) sys.close(try sys.accept(nodes[i]));
+    }
+
+    var got: [128]u8 = undefined;
+    const n = try sys.read(pair[1], &got);
+    if (spec.kind == .http_connect) {
+        try std.testing.expectEqualStrings(http.connected, got[0..n]);
+    } else {
+        try std.testing.expectEqual(@as(usize, 12), n);
+        try std.testing.expectEqualSlices(u8, &.{ 5, 0 }, got[0..2]);
+        try std.testing.expectEqualSlices(u8, &socks5.reply(.succeeded), got[2..12]);
+    }
+    if (spec.dials == null) {
+        try std.testing.expectEqual(@as(usize, 0), try sys.read(pair[1], &got));
+    } else try std.testing.expectError(error.WouldBlock, sys.read(pair[1], &got));
+}
+
+test "matched domain dials only the first healthy exit" {
+    try routeCase(.{
+        .host = "ai.example.test",
+        .kind = .domain,
+        .up = .{ true, true, true },
+        .dials = 1,
+        .tried = 1 << 1,
+    });
+}
+
+test "matched domain fails over inside its exit group only" {
+    // Case differs from the suffix on purpose: matching is ASCII case-insensitive.
+    try routeCase(.{
+        .host = "Chat.AI.Example.Test",
+        .kind = .domain,
+        .up = .{ true, false, true },
+        .dials = 2,
+        .tried = (1 << 1) | (1 << 2),
+    });
+}
+
+test "matched domain closes when every exit fails" {
+    try routeCase(.{
+        .host = "edge.ai.example.test",
+        .kind = .domain,
+        .up = .{ true, false, false },
+        .dials = null,
+        .tried = (1 << 1) | (1 << 2),
+    });
+}
+
+test "backing-off exit group probes once and does not use default" {
+    // exit-b is listening, so a second probe would be visible. It must not happen.
+    try routeCase(.{
+        .host = "ai.example.test",
+        .kind = .domain,
+        .up = .{ true, false, true },
+        .backoff = .{ false, true, true },
+        .dials = null,
+        .tried = 1 << 1,
+    });
+}
+
+test "unmatched and near-miss domains use only the default outbound" {
+    // "notai.example.test" ends in the suffix text but is not a label boundary.
+    try routeCase(.{
+        .host = "notai.example.test",
+        .kind = .domain,
+        .up = .{ true, true, true },
+        .dials = 0,
+        .tried = 1 << 0,
+    });
+    try routeCase(.{
+        .host = "other.example.test",
+        .kind = .domain,
+        .up = .{ true, true, true },
+        .dials = 0,
+        .tried = 1 << 0,
+    });
+}
+
+test "sniffed IP target and HTTP CONNECT stay inside the matched exit group" {
+    try routeCase(.{
+        .host = "edge.ai.example.test",
+        .kind = .sniffed_ip,
+        .up = .{ true, false, true },
+        .dials = 2,
+        .tried = (1 << 1) | (1 << 2),
+    });
+    try routeCase(.{
+        .host = "api.ai.example.test",
+        .kind = .http_connect,
+        .up = .{ true, false, false },
+        .dials = null,
+        .tried = (1 << 1) | (1 << 2),
+    });
+}
