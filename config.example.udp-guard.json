@@ -1,0 +1,48 @@
+{
+  "listen": "127.0.0.1:1080",
+  "redirect": "",
+  "sniff": true,
+  "udp_unknown": "reject",
+  "outbounds": [
+    {
+      "tag": "japan",
+      "server": "japan.example.test",
+      "port": 443,
+      "security": "reality",
+      "sni": "example.com",
+      "public_key": "<server publicKey, base64url>",
+      "short_id": "",
+      "uuid": "00000000-0000-0000-0000-000000000000"
+    },
+    {
+      "tag": "exit-a",
+      "server": "exit-a.example.test",
+      "port": 443,
+      "security": "tls",
+      "tls_verify": "none",
+      "sni": "exit-a.example.test",
+      "uuid": "00000000-0000-0000-0000-000000000001",
+      "flow": "xtls-rprx-vision",
+      "dialer": "japan"
+    },
+    {
+      "tag": "exit-b",
+      "server": "exit-b.example.test",
+      "port": 443,
+      "security": "tls",
+      "tls_verify": "none",
+      "sni": "exit-b.example.test",
+      "uuid": "00000000-0000-0000-0000-000000000002",
+      "flow": "xtls-rprx-vision",
+      "dialer": "japan"
+    }
+  ],
+  "rules": [
+    {
+      "domain_suffix": ["ai.example.test"],
+      "outbound": ["exit-a", "exit-b"]
+    }
+  ],
+  "default": ["japan"],
+  "fail_backoff_s": 30
+}

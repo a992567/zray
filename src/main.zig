@@ -60,6 +60,9 @@ const FileConfig = struct {
     /// Tags for traffic no rule matches; default: the first outbound.
     default: []const []const u8 = &.{},
     fail_backoff_s: u64 = 30,
+    /// `default`: a UDP IP target uses the default group (historical).
+    /// `reject`: drop it. Domain targets still follow `rules`.
+    udp_unknown: @import("linux/conn.zig").UdpUnknown = .default,
     /// Mixed SOCKS5 / HTTP inbound; empty string disables it.
     listen: []const u8 = "127.0.0.1:1080",
     /// Transparent inbound for netfilter REDIRECT (iptables -j REDIRECT /
@@ -299,6 +302,7 @@ fn linuxMain(init: std.process.Init) !void {
         .sniff = parsed.sniff,
         .fail_backoff_s = parsed.fail_backoff_s,
         .stats_interval_s = parsed.stats_interval_s,
+        .udp_unknown = parsed.udp_unknown,
     };
 
     if (parsed.listen.len == 0 and parsed.redirect.len == 0) {
@@ -312,8 +316,8 @@ fn linuxMain(init: std.process.Init) !void {
         std.meta.stringToEnum(@import("linux/kernel_crypto.zig").Policy, value) orelse return error.BadCryptoBackend
     else
         parsed.crypto_backend;
-    sys.log("zray {s} socks5/http [{s}] redirect [{s}] sniff {}, {d} outbounds, {d} rules, {d} slots x {d} KiB, single event loop, splice enabled, crypto_backend {s} bytes={d}..{d}", .{
-        version, parsed.listen, parsed.redirect, parsed.sniff, obs.len, rules.len, parsed.max_connections, @sizeOf(conn.Conn) / 1024, @tagName(policy), limits.min_bytes, limits.max_bytes,
+    sys.log("zray {s} socks5/http [{s}] redirect [{s}] sniff {} udp_unknown {s}, {d} outbounds, {d} rules, {d} slots x {d} KiB, single event loop, splice enabled, crypto_backend {s} bytes={d}..{d}", .{
+        version, parsed.listen, parsed.redirect, parsed.sniff, @tagName(parsed.udp_unknown), obs.len, rules.len, parsed.max_connections, @sizeOf(conn.Conn) / 1024, @tagName(policy), limits.min_bytes, limits.max_bytes,
     });
     for (obs, node_cfgs) |ob, oc| {
         // Keep the "mode ..." phrases: the startup smoke test matches them,
@@ -592,6 +596,15 @@ test "deprecated workers configuration is accepted for compatibility" {
     const parsed = try std.json.parseFromSlice(FileConfig, std.testing.allocator, "{\"workers\":65535}", .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(?u16, 65535), parsed.value.workers);
+}
+
+test "udp_unknown defaults to default and reject is explicit" {
+    const defaults: FileConfig = .{};
+    try std.testing.expectEqual(@import("linux/conn.zig").UdpUnknown.default, defaults.udp_unknown);
+    const parsed = try std.json.parseFromSlice(FileConfig, std.testing.allocator, "{\"udp_unknown\":\"reject\"}", .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@import("linux/conn.zig").UdpUnknown.reject, parsed.value.udp_unknown);
+    try std.testing.expectError(error.InvalidEnumTag, std.json.parseFromSlice(FileConfig, std.testing.allocator, "{\"udp_unknown\":\"drop\"}", .{}));
 }
 
 test "kernel crypto defaults off and payload limits parse from config" {

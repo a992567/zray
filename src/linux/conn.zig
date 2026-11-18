@@ -87,7 +87,15 @@ pub const Config = struct {
     /// Seconds an outbound is skipped after it failed to connect.
     fail_backoff_s: u64 = 30,
     stats_interval_s: u64 = 60,
+    /// What to do with a UDP datagram whose target is an IP. Domain rules
+    /// cannot name an IP, and this client does not map DNS answers or parse
+    /// QUIC. `default` keeps the historical behaviour (the default group).
+    /// `reject` drops the datagram and does not open an outbound for it.
+    udp_unknown: UdpUnknown = .default,
 };
+
+/// UDP target that is not a domain name.
+pub const UdpUnknown = enum { default, reject };
 
 /// Does `host` equal `suffix` or end in ".suffix"? (ASCII case-insensitive)
 pub fn domainMatch(host: []const u8, suffix: []const u8) bool {
@@ -130,6 +138,9 @@ pub const State = enum {
     tls_handshake,
     /// TLS up, HTTP Upgrade sent, waiting for 101.
     ws_upgrade,
+    /// SOCKS UDP ASSOCIATE accepted. The upstream is chosen from the first
+    /// datagram that belongs to a group, not from the default outbound.
+    udp_wait,
     relay,
 };
 
@@ -161,6 +172,12 @@ pub const Conn = struct {
     udp_fd: sys.fd_t = -1,
     udp_peer: ?sys.SockAddr = null,
     udp_started: bool = false,
+    /// The association's outbound group has been chosen.
+    udp_locked: bool = false,
+    /// A datagram in `cin` waiting until the UDP tunnel reaches `.relay`.
+    udp_hold: u16 = 0,
+    /// Dropped datagrams on this association (the first one is logged).
+    udp_drops: u16 = 0,
     global_id: [8]u8 = undefined,
     mux_in: [mux.max_frame_len]u8 = undefined,
     mux_in_len: usize = 0,
@@ -278,6 +295,9 @@ pub const Loop = struct {
         c.udp_fd = -1;
         c.udp_peer = null;
         c.udp_started = false;
+        c.udp_locked = false;
+        c.udp_hold = 0;
+        c.udp_drops = 0;
         c.mux_in_len = 0;
         c.cin_len = 0;
         c.up_out_off = 0;
@@ -384,6 +404,11 @@ pub const Loop = struct {
         const now_ms = sys.monotonicMs();
         for (l.conns) |*c| {
             if (c.state == .free) continue;
+            if (c.state == .udp_wait) {
+                // No datagram yet. This is idle, not a handshake.
+                if (now - c.last_active > l.cfg.idle_timeout_s) l.close(c, "timeout");
+                continue;
+            }
             if (c.state == .sniffing and now_ms - c.sniff_since_ms >= 1000) {
                 // Server-first protocol (or a slow client): use the default route.
                 c.group = l.cfg.default_group;
@@ -488,7 +513,7 @@ pub const Loop = struct {
                 const rec = try c.tls.close(&c.up_out);
                 c.up_out_off = 0;
                 c.up_out_len = rec.len;
-                try l.flushUpstream(c);
+                try l.drainUpstream(c);
             }
         }
         if (c.client_eof and c.up_eof and c.cin_len == 0 and c.c_out_len == 0 and c.up_out_len == 0 and c.upload_pipe.pending == 0 and c.download_pipe.pending == 0) l.close(c, "eof");
@@ -504,9 +529,11 @@ pub const Loop = struct {
             l.setInterest(c.client_fd, &c.client_ev, cev, c.token(.client));
         }
         if (c.udp_fd >= 0) {
-            // Datagrams wait in the kernel until the tunnel is up and the
-            // upstream queue is empty.
-            const dev: u32 = if (c.state == .relay and c.up_out_len == 0) sys.EPOLL.IN else 0;
+            // Before a group is chosen, read the datagram that selects it.
+            // After that, the kernel holds further datagrams until the one
+            // tunnel is up and its queue is empty.
+            const want_udp = c.udp_hold == 0 and (c.state == .udp_wait or (c.state == .relay and c.up_out_len == 0));
+            const dev: u32 = if (want_udp) sys.EPOLL.IN else 0;
             if (dev != c.udp_ev) {
                 sys.epollMod(l.ep, c.udp_fd, dev, c.token(.udp)) catch {};
                 c.udp_ev = dev;
@@ -643,9 +670,13 @@ pub const Loop = struct {
                 c.consumeClient(req.len);
                 if (req.command == .udp_associate) {
                     try l.openUdpRelay(c);
-                    c.group = l.cfg.default_group;
-                    if (c.forced) |f| c.group = ob_index[f..][0..1];
-                    try l.startUpstream(c);
+                    // A hop connection is pinned. A client association waits
+                    // for a datagram: the SOCKS address here is not the target.
+                    if (c.forced) |f| {
+                        c.group = ob_index[f..][0..1];
+                        c.udp_locked = true;
+                        try l.startUpstream(c);
+                    } else c.state = .udp_wait;
                     return;
                 }
                 // Reply right away (like xray) so the client starts its own TLS
@@ -698,6 +729,7 @@ pub const Loop = struct {
             },
             .http_error => {},
             .sniffing => try l.sniffRoute(c),
+            .udp_wait => {},
             .connecting, .socks_dial, .tls_handshake, .ws_upgrade => {}, // buffer in cin until the tunnel is up
             .relay => try l.forwardClient(c),
             .free => unreachable,
@@ -780,9 +812,51 @@ pub const Loop = struct {
         try l.flushClient(c);
     }
 
+    /// Group for one UDP destination, or null when the datagram must be dropped.
+    /// An IP is never matched to a domain rule: there is no DNS map and no
+    /// QUIC parser here. One association has one upstream, so a later
+    /// destination that wants a different group is also dropped rather than
+    /// sent on the tunnel already chosen.
+    fn udpTargetGroup(cfg: *const Config, addr: socks5.Address, locked: ?[]const u8) ?[]const u8 {
+        const want: []const u8 = switch (addr) {
+            .domain => |d| routeFor(cfg, d),
+            .ipv4, .ipv6 => if (cfg.udp_unknown == .reject) return null else cfg.default_group,
+        };
+        if (locked) |g| if (!mem.eql(u8, g, want)) return null;
+        return want;
+    }
+
+    fn noteUdpDrop(c: *Conn, why: []const u8) void {
+        if (c.udp_drops == 0) sys.log("[{d}] udp drop: {s}", .{ c.slot, why });
+        c.udp_drops +|= 1;
+    }
+
+    /// Lock the association on the first datagram that has a group. Returns
+    /// false when the datagram must not be forwarded.
+    fn udpAdmit(l: *Loop, c: *Conn, addr: socks5.Address) !bool {
+        const locked: ?[]const u8 = if (c.udp_locked) c.group else null;
+        const want = udpTargetGroup(l.cfg, addr, locked) orelse {
+            const why: []const u8 = if (c.udp_locked)
+                "destination is outside this association's group"
+            else
+                "ip target and udp_unknown=reject";
+            noteUdpDrop(c, why);
+            return false;
+        };
+        if (!c.udp_locked) {
+            c.group = want;
+            c.udp_locked = true;
+            sys.log("[{d}] udp group {s}", .{ c.slot, l.cfg.outbounds[want[0]].tag });
+            try l.startUpstream(c);
+        }
+        return true;
+    }
+
     /// One datagram from the client -> one XUDP frame in one TLS record.
     fn readUdp(l: *Loop, c: *Conn) !void {
-        if (c.state != .relay or c.up_out_len > 0) return;
+        if (c.udp_hold != 0) return;
+        if (c.state != .udp_wait and c.state != .relay) return;
+        if (c.state == .relay and c.up_out_len > 0) return;
         const dg = sys.recvFrom(c.udp_fd, &c.cin) catch |e| switch (e) {
             error.WouldBlock => return,
             else => return e,
@@ -795,17 +869,37 @@ pub const Loop = struct {
         const hdr = (socks5.parseUdpHeader(dgram) catch return) orelse return;
         const payload = dgram[hdr.len..];
         if (payload.len == 0 or payload.len > mux.max_packet_len) return;
+        if (!try l.udpAdmit(c, hdr.address)) return;
+        if (c.state != .relay) {
+            c.udp_hold = std.math.cast(u16, dg.len) orelse return error.UdpHoldTooLarge;
+            return;
+        }
+        try queueUdpRecord(c, hdr, payload);
+        try l.flushUpstream(c);
+    }
+
+    fn queueHeldUdp(c: *Conn) !void {
+        const n = c.udp_hold;
+        c.udp_hold = 0;
+        if (n == 0) return;
+        const dgram = c.cin[0..n];
+        const hdr = (socks5.parseUdpHeader(dgram) catch return error.UdpHold) orelse return error.UdpHold;
+        const payload = dgram[hdr.len..];
+        if (payload.len == 0 or payload.len > mux.max_packet_len) return error.UdpHold;
+        try queueUdpRecord(c, hdr, payload);
+    }
+
+    fn queueUdpRecord(c: *Conn, hdr: socks5.UdpHeader, payload: []const u8) !void {
         const addr: mux.Address = switch (hdr.address) {
             .ipv4 => |a| .{ .ipv4 = a },
             .ipv6 => |a| .{ .ipv6 = a },
             .domain => |d| .{ .domain = d },
         };
-
         var frame_buf: [client_chunk + 300]u8 = undefined;
         const frame = if (!c.udp_started)
-            mux.encodeNew(&frame_buf, addr, hdr.port, c.global_id, payload) catch return
+            mux.encodeNew(&frame_buf, addr, hdr.port, c.global_id, payload) catch return error.UdpFrame
         else
-            mux.encodeKeep(&frame_buf, addr, hdr.port, payload) catch return;
+            mux.encodeKeep(&frame_buf, addr, hdr.port, payload) catch return error.UdpFrame;
         c.udp_started = true;
 
         var padded_buf: [client_chunk + 300 + 2 * vision.max_overhead]u8 = undefined;
@@ -813,7 +907,6 @@ pub const Loop = struct {
         const rec = c.tls.encrypt(padded, &c.up_out) catch return error.TlsEncrypt;
         c.up_out_off = 0;
         c.up_out_len = rec.len;
-        try l.flushUpstream(c);
     }
 
     /// Parse complete mux frames out of `mux_in` and hand packets to the client.
@@ -1178,7 +1271,8 @@ pub const Loop = struct {
         try l.flushUpstream(c);
     }
 
-    fn flushUpstream(l: *Loop, c: *Conn) !void {
+    /// Write `up_out`. A short write leaves the remainder queued.
+    fn drainUpstream(_: *Loop, c: *Conn) sys.Error!void {
         while (c.up_out_len > 0) {
             const n = sys.write(c.up_fd, c.up_out[c.up_out_off..][0..c.up_out_len]) catch |e| switch (e) {
                 error.WouldBlock => return,
@@ -1189,6 +1283,16 @@ pub const Loop = struct {
             c.up_out_len -= n;
         }
         c.up_out_off = 0;
+    }
+
+    fn flushUpstream(l: *Loop, c: *Conn) !void {
+        try l.drainUpstream(c);
+        if (c.up_out_len > 0) return;
+        if (c.state == .relay and c.udp_hold != 0) {
+            try queueHeldUdp(c);
+            try l.drainUpstream(c);
+            if (c.up_out_len > 0) return;
+        }
         if (c.state == .relay) try l.finishDirections(c);
     }
 
@@ -2031,6 +2135,284 @@ test "unmatched and near-miss domains use only the default outbound" {
         .up = .{ true, true, true },
         .dials = 0,
         .tried = 1 << 0,
+    });
+}
+
+test "udp target group does not invent a name for an ip" {
+    const exit = [_]u8{ 1, 2 };
+    const def = [_]u8{0};
+    const suffixes = [_][]const u8{"ai.example.test"};
+    const rules = [_]Rule{.{ .suffixes = &suffixes, .group = &exit }};
+    const cfg: Config = .{ .outbounds = &.{}, .rules = &rules, .default_group = &def };
+    const matched = Loop.udpTargetGroup(&cfg, .{ .domain = "a.ai.example.test" }, null).?;
+    try std.testing.expectEqualSlices(u8, &exit, matched);
+    const other = Loop.udpTargetGroup(&cfg, .{ .domain = "notai.example.test" }, null).?;
+    try std.testing.expectEqualSlices(u8, &def, other);
+    const ip = Loop.udpTargetGroup(&cfg, .{ .ipv4 = .{ 8, 8, 8, 8 } }, null).?;
+    try std.testing.expectEqualSlices(u8, &def, ip);
+    var rejected = cfg;
+    rejected.udp_unknown = .reject;
+    try std.testing.expect(Loop.udpTargetGroup(&rejected, .{ .ipv4 = .{ 8, 8, 8, 8 } }, null) == null);
+    var v6: [16]u8 = @splat(0);
+    v6[15] = 1;
+    try std.testing.expect(Loop.udpTargetGroup(&rejected, .{ .ipv6 = v6 }, null) == null);
+    try std.testing.expect(Loop.udpTargetGroup(&cfg, .{ .domain = "other.example.test" }, exit[0..]) == null);
+    try std.testing.expect(Loop.udpTargetGroup(&cfg, .{ .ipv4 = .{ 8, 8, 8, 8 } }, exit[0..]) == null);
+    const again = Loop.udpTargetGroup(&cfg, .{ .domain = "ai.example.test" }, exit[0..]).?;
+    try std.testing.expectEqualSlices(u8, &exit, again);
+}
+
+const UdpDest = union(enum) {
+    domain: []const u8,
+    ipv4: [4]u8,
+};
+
+const UdpSpec = struct {
+    dest: UdpDest,
+    unknown: UdpUnknown = .default,
+    /// Listening (true) or bound-only, so connect is refused.
+    up: [3]bool,
+    ws_exits: bool = false,
+    backoff: [3]bool = .{ false, false, false },
+    /// null and `stay`: association stays up and dials nobody.
+    /// null otherwise: association closes.
+    dials: ?u8,
+    tried: u16,
+    stay: bool = false,
+};
+
+fn driveUdp(ep: sys.fd_t, loop: *Loop, c: *Conn, kind: enum { wait, up, dead, dropped }) !void {
+    for (0..30) |_| {
+        const ready = switch (kind) {
+            .wait => c.state == .udp_wait and c.up_fd < 0,
+            .up => c.state == .tls_handshake,
+            .dead => c.state == .free,
+            .dropped => c.state == .udp_wait and c.udp_drops > 0 and c.up_fd < 0,
+        };
+        if (ready) return;
+        var events: [8]sys.Event = undefined;
+        const n = try sys.epollWait(ep, &events, 100);
+        for (events[0..n]) |ev| loop.handle(ev.data.u64, ev.events);
+    }
+    std.debug.print("udp {s}: state={s} ob={d} tries={d} mask={d} drops={d}\n", .{
+        @tagName(kind), @tagName(c.state), c.ob, c.tries, c.tried_mask, c.udp_drops,
+    });
+    return error.Timeout;
+}
+
+fn udpGuardCase(spec: UdpSpec) !void {
+    const linux = std.os.linux;
+    var nodes = [_]sys.fd_t{ -1, -1, -1 };
+    defer for (nodes) |fd| if (fd >= 0) sys.close(fd);
+    var addrs: [3]sys.SockAddr = undefined;
+    for (spec.up, 0..) |listen_ok, i| {
+        const fd = try sys.tcpSocket(linux.AF.INET);
+        nodes[i] = fd;
+        const any = sys.SockAddr.fromIpv4(.{ 127, 0, 0, 1 }, 0);
+        try sys.bind(fd, &any);
+        if (listen_ok) try sys.listen(fd, 4);
+        addrs[i] = try sys.localAddr(fd);
+    }
+    var obs = [_]Outbound{
+        .{ .tag = "japan", .addr = addrs[0], .sni = "japan.example.test", .uuid = @splat(1) },
+        .{ .tag = "exit-a", .addr = addrs[1], .sni = "exit-a.example.test", .uuid = @splat(2) },
+        .{ .tag = "exit-b", .addr = addrs[2], .sni = "exit-b.example.test", .uuid = @splat(3) },
+    };
+    if (spec.ws_exits) {
+        obs[1].ws = true;
+        obs[2].ws = true;
+    }
+    const suffixes = [_][]const u8{"ai.example.test"};
+    const exit_group = [_]u8{ 1, 2 };
+    const default_group = [_]u8{0};
+    const rules = [_]Rule{.{ .suffixes = &suffixes, .group = &exit_group }};
+    const cfg: Config = .{
+        .outbounds = &obs,
+        .rules = &rules,
+        .default_group = &default_group,
+        .fail_backoff_s = 30,
+        .udp_unknown = spec.unknown,
+        .sniff = true,
+    };
+
+    const ln = try sys.tcpSocket(linux.AF.INET);
+    defer sys.close(ln);
+    const any = sys.SockAddr.fromIpv4(.{ 127, 0, 0, 1 }, 0);
+    try sys.bind(ln, &any);
+    try sys.listen(ln, 1);
+    const tcp = try sys.tcpSocket(linux.AF.INET);
+    defer sys.close(tcp);
+    const ln_addr = try sys.localAddr(ln);
+    _ = try sys.connect(tcp, &ln_addr);
+    try std.testing.expect(try sys.pollIn(ln, 1000));
+    const accepted = try sys.accept(ln);
+
+    const ep = try sys.epollCreate();
+    defer sys.close(ep);
+    var conns: [1]Conn = undefined;
+    var loop = Loop.init(ep, &cfg, &conns);
+    loop.accept(accepted, .socks5, null);
+    const c = &conns[0];
+    defer if (c.state != .free) loop.close(c, "test finished");
+
+    const preset = sys.monotonicSeconds() + 3600;
+    for (spec.backoff, 0..) |on, i| {
+        if (on) loop.bad_until[i] = preset;
+    }
+
+    var req: [16]u8 = undefined;
+    req[0..3].* = .{ 5, 1, 0 };
+    req[3..13].* = .{ 5, 3, 0, 1, 0, 0, 0, 0, 0, 0 };
+    try std.testing.expectEqual(@as(usize, 13), try sys.write(tcp, req[0..13]));
+    try driveUdp(ep, &loop, c, .wait);
+
+    var reply: [32]u8 = undefined;
+    var got: usize = 0;
+    while (got < 12) {
+        const n = sys.read(tcp, reply[got..]) catch |e| switch (e) {
+            error.WouldBlock => {
+                try std.testing.expect(try sys.pollIn(tcp, 200));
+                continue;
+            },
+            else => return e,
+        };
+        if (n == 0) return error.Closed;
+        got += n;
+    }
+    try std.testing.expectEqualSlices(u8, &.{ 5, 0, 5, 0 }, reply[0..4]);
+    const relay_port = mem.readInt(u16, reply[10..12], .big);
+    // ASSOCIATE itself must not dial any outbound.
+    for (nodes, spec.up) |fd, listen_ok| {
+        if (listen_ok) try std.testing.expect(!try sys.pollIn(fd, 20));
+    }
+
+    var pkt: [256]u8 = undefined;
+    const head = try socks5.encodeUdpHeader(&pkt, switch (spec.dest) {
+        .domain => |d| .{ .domain = d },
+        .ipv4 => |a| .{ .ipv4 = a },
+    }, 53);
+    const payload = "ping";
+    @memcpy(pkt[head.len..][0..payload.len], payload);
+    const udp = try sys.udpSocket(linux.AF.INET);
+    defer sys.close(udp);
+    const from = sys.SockAddr.fromIpv4(.{ 127, 0, 0, 1 }, 0);
+    try sys.bind(udp, &from);
+    const to = sys.SockAddr.fromIpv4(.{ 127, 0, 0, 1 }, relay_port);
+    try std.testing.expectEqual(head.len + payload.len, try sys.sendTo(udp, pkt[0 .. head.len + payload.len], &to));
+
+    if (spec.stay) {
+        try driveUdp(ep, &loop, c, .dropped);
+        try std.testing.expectEqual(@as(u16, 0), c.tried_mask);
+        try std.testing.expect(!c.udp_locked);
+        try std.testing.expectError(error.WouldBlock, sys.read(tcp, &reply));
+    } else if (spec.dials) |idx| {
+        try driveUdp(ep, &loop, c, .up);
+        // The datagram that chose the group is held until the tunnel is up.
+        try std.testing.expect(c.udp_hold != 0);
+        try std.testing.expectEqual(idx, c.ob);
+        try std.testing.expectEqual(spec.tried, c.tried_mask);
+        try std.testing.expectEqual(addrs[idx].getPort(), (try sys.peerAddr(c.up_fd)).getPort());
+        if (idx != 0) {
+            try std.testing.expect(!try loop.udpAdmit(c, .{ .domain = "other.example.test" }));
+            try std.testing.expect(!try loop.udpAdmit(c, .{ .ipv4 = .{ 8, 8, 8, 8 } }));
+            try std.testing.expect(try loop.udpAdmit(c, .{ .domain = "ai.example.test" }));
+            try std.testing.expectEqual(addrs[idx].getPort(), (try sys.peerAddr(c.up_fd)).getPort());
+        }
+    } else {
+        try driveUdp(ep, &loop, c, .dead);
+        try std.testing.expectEqual(spec.tried, c.tried_mask);
+        try std.testing.expectEqual(@as(usize, 0), try sys.read(tcp, &reply));
+    }
+
+    const matched = switch (spec.dest) {
+        .domain => |d| domainMatch(d, suffixes[0]),
+        .ipv4 => false,
+    };
+    if (spec.stay) {
+        try std.testing.expectEqual(@as(usize, 0), c.group.len);
+    } else if (matched) {
+        try std.testing.expectEqualSlices(u8, &exit_group, c.group);
+    } else try std.testing.expectEqualSlices(u8, &default_group, c.group);
+
+    for (spec.up, 0..) |listen_ok, i| {
+        if (!listen_ok) continue;
+        const queued = try sys.pollIn(nodes[i], 30);
+        const wanted = if (spec.dials) |idx| idx == i else false;
+        try std.testing.expectEqual(wanted, queued);
+        if (queued) sys.close(try sys.accept(nodes[i]));
+    }
+}
+
+test "udp associate does not dial before the first datagram" {
+    try udpGuardCase(.{
+        .dest = .{ .domain = "ai.example.test" },
+        .up = .{ true, true, true },
+        .dials = 1,
+        .tried = 1 << 1,
+    });
+}
+
+test "udp matched domain fails over inside its group only" {
+    try udpGuardCase(.{
+        .dest = .{ .domain = "Chat.AI.Example.Test" },
+        .up = .{ true, false, true },
+        .dials = 2,
+        .tried = (1 << 1) | (1 << 2),
+    });
+}
+
+test "udp matched domain closes when every exit fails" {
+    try udpGuardCase(.{
+        .dest = .{ .domain = "edge.ai.example.test" },
+        .up = .{ true, false, false },
+        .dials = null,
+        .tried = (1 << 1) | (1 << 2),
+    });
+}
+
+test "udp ws exit group closes and does not dial the default" {
+    try udpGuardCase(.{
+        .dest = .{ .domain = "ai.example.test" },
+        .up = .{ true, true, true },
+        .ws_exits = true,
+        .dials = null,
+        .tried = (1 << 1) | (1 << 2),
+    });
+}
+
+test "udp backing-off exit group probes once" {
+    try udpGuardCase(.{
+        .dest = .{ .domain = "ai.example.test" },
+        .up = .{ true, false, true },
+        .backoff = .{ false, true, true },
+        .dials = null,
+        .tried = 1 << 1,
+    });
+}
+
+test "udp unmatched domain and unknown ip use only the default outbound" {
+    try udpGuardCase(.{
+        .dest = .{ .domain = "notai.example.test" },
+        .up = .{ true, true, true },
+        .dials = 0,
+        .tried = 1 << 0,
+    });
+    try udpGuardCase(.{
+        .dest = .{ .ipv4 = .{ 203, 0, 113, 10 } },
+        .up = .{ true, true, true },
+        .dials = 0,
+        .tried = 1 << 0,
+    });
+}
+
+test "udp unknown ip is dropped when udp_unknown is reject" {
+    try udpGuardCase(.{
+        .dest = .{ .ipv4 = .{ 203, 0, 113, 10 } },
+        .unknown = .reject,
+        .up = .{ true, true, true },
+        .dials = null,
+        .tried = 0,
+        .stay = true,
     });
 }
 

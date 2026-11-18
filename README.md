@@ -313,6 +313,7 @@ node fields, plus:
 | `rules` | `[]` | First match wins. `domain_suffix` is a list of ASCII suffixes (`example.com` matches that host and `a.example.com`). `outbound` is the group of tags to use. |
 | `default` | the first outbound | Group used when no rule matches. |
 | `fail_backoff_s` | `30` | After a member fails to connect, skip it for this many seconds and try the next member of that same group. Failover only moves to members not in backoff; while all are in backoff each connection makes a single probe attempt. If no member is left, the connection closes. |
+| `udp_unknown` | `default` | UDP to an IP cannot be matched to a domain rule. `default` sends it to the default group. `reject` drops it. A domain name follows `rules` and never falls back to another group. See [docs/udp-guard.zh-CN.md](docs/udp-guard.zh-CN.md). |
 
 At most 16 outbounds. A `dialer` tag must refer to an entry listed before
 it. UDP is only carried on a Vision TCP outbound. When the target is an IP
@@ -495,7 +496,10 @@ python3 tools/httptest.py zig-out/bin/zray
   member of a group is skipped for `fail_backoff_s`, but only in favour of
   another member of that same group.
 - UDP payloads above roughly 600 bytes may be dropped depending on the server's
-  outbound; DNS works, QUIC generally does not.
+  outbound; DNS works, QUIC generally does not. SOCKS UDP to a domain follows
+  the same group as TCP. An IP target does not: there is no DNS map and no
+  QUIC parser. Transparent UDP is not implemented. Details and the
+  `udp_unknown` switch: [docs/udp-guard.zh-CN.md](docs/udp-guard.zh-CN.md).
 - No log level control; every connection logs its lifecycle to stderr.
 
 ## License

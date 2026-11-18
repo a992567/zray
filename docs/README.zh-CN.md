@@ -297,6 +297,7 @@ Wi-Fi、运营商中间设备、上游被入侵的路由器）都可以冒充服
 是某个成员连接失败后被跳过的秒数；只在**同一组**内换下一个，命中的规则不会
 退回到别的组或 `default`。切换只会换到不在 backoff 期的成员；组内全部处于
 backoff 时，每条连接只探测一次，失败即断开。最多 16 个节点。UDP 只走带 Vision 的 TCP 节点。
+SOCKS UDP 的域名和 TCP 用同一套分组，命中后不会退回 `default`；IP 目标无法归到规则，由 `udp_unknown` 决定走默认组还是丢弃。没有透明 UDP。详见 [udp-guard.zh-CN.md](udp-guard.zh-CN.md)。
 目标是 IP 且可能命中规则时，最多等 1 秒嗅探 SNI / Host，否则用 `default`。
 示例见 [config.example.routing.json](../config.example.routing.json)。
 
